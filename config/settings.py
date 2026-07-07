@@ -106,11 +106,21 @@ MEDIA_ROOT = BASE_DIR / "media"
 
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
-CORS_ALLOWED_ORIGINS = [
-    origin.strip()
-    for origin in os.getenv("CORS_ALLOWED_ORIGINS", "").split(",")
-    if origin.strip()
+DEPLOYED_CORS_ALLOWED_ORIGINS = [
+    "https://live-auction.stride-events.net",
+    "https://cricket-auction-hub-three.vercel.app",
+    "https://auction-apex.vercel.app",
 ]
+CORS_ALLOWED_ORIGINS = sorted(
+    {
+        *DEPLOYED_CORS_ALLOWED_ORIGINS,
+        *[
+            origin.strip()
+            for origin in os.getenv("CORS_ALLOWED_ORIGINS", "").split(",")
+            if origin.strip()
+        ],
+    }
+)
 LOCAL_DEV_CORS_ALLOWED_ORIGIN_REGEXES = [
     r"^https?://localhost:\d+$",
     r"^https?://127\.0\.0\.1:\d+$",
