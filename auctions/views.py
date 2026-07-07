@@ -650,8 +650,9 @@ class AuctionViewSet(viewsets.ModelViewSet):
             player=player,
             defaults={"team": team, "sold_price": sold_price},
         )
+        auction.sold_animation_state = True
+        auction.save(update_fields=["sold_animation_state"])
         AuctionLog.objects.create(auction=auction, actor=request.user, action="player.sold", message=f"{player.full_name} sold to {team.short_name}.")
-        advance_to_random_player(auction, request.user)
         return Response(serialize_live_state(auction))
 
     @action(detail=True, methods=["post"], url_path="mark-unsold")

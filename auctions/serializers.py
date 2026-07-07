@@ -373,10 +373,12 @@ class BidSerializer(serializers.ModelSerializer):
 
 class SoldPlayerSerializer(serializers.ModelSerializer):
     player_name = serializers.CharField(source="player.full_name", read_only=True)
+    player_image_url = serializers.CharField(source="player.image_url", read_only=True)
     player_role = serializers.CharField(source="player.role", read_only=True)
     player_category = serializers.CharField(source="player.category.name", read_only=True)
     team_name = serializers.CharField(source="team.name", read_only=True)
     team_short_name = serializers.CharField(source="team.short_name", read_only=True)
+    team_logo_url = serializers.CharField(source="team.logo_url", read_only=True)
 
     class Meta:
         model = SoldPlayer
@@ -385,11 +387,13 @@ class SoldPlayerSerializer(serializers.ModelSerializer):
             "auction",
             "player",
             "player_name",
+            "player_image_url",
             "player_role",
             "player_category",
             "team",
             "team_name",
             "team_short_name",
+            "team_logo_url",
             "sold_price",
             "sold_time",
         ]
