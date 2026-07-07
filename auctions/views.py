@@ -235,6 +235,13 @@ def highest_approved_bid(auction: Auction, player: Player | None = None):
     return qs.order_by("-bid_amount", "-approved_at", "-created_at").first()
 
 
+def highest_active_bid(auction: Auction, player: Player | None = None):
+    qs = auction.bids.filter(bid_status__in=[Bid.Status.PENDING, Bid.Status.APPROVED])
+    if player:
+        qs = qs.filter(player=player)
+    return qs.order_by("-bid_amount", "-created_at").first()
+
+
 def remaining_required_points(team: Team) -> Decimal:
     total = Decimal("0")
     for limit in team.category_limits.select_related("category"):
@@ -328,13 +335,13 @@ def serialize_live_state(auction: Auction, team_scope: Team | None = None) -> di
     current_player = auction.current_player
     current_player_bids = (
         auction.bids.select_related("player", "team")
-        .filter(player=current_player, bid_status=Bid.Status.APPROVED)
-        .order_by("-bid_amount", "-approved_at", "-created_at")
+        .filter(player=current_player, bid_status__in=[Bid.Status.PENDING, Bid.Status.APPROVED])
+        .order_by("-bid_amount", "-created_at")
         if current_player
         else Bid.objects.none()
     )
     bid_feed = auction.bids.select_related("player", "team").filter(bid_status=Bid.Status.APPROVED)[:20]
-    pending_qs = auction.bids.select_related("player", "team").filter(bid_status=Bid.Status.PENDING)
+    pending_qs = auction.bids.select_related("player", "team").filter(bid_status=Bid.Status.PENDING).order_by("-bid_amount", "-created_at")
     teams_qs = auction.teams.all()
     sold_players_qs = auction.sold_players.select_related("player", "team")
     results = build_results(auction)
@@ -346,11 +353,12 @@ def serialize_live_state(auction: Auction, team_scope: Team | None = None) -> di
         if results["top_sale"] and results["top_sale"]["team"] != team_scope.pk:
             results["top_sale"] = None
     pending = pending_qs[:20]
+    current_bid = highest_active_bid(auction, current_player) if current_player else None
     return {
         "auction": AuctionSerializer(auction).data,
         "current_player": PlayerSerializer(current_player).data if current_player else None,
         "teams": TeamSerializer(teams_qs, many=True).data,
-        "current_bid": BidSerializer(highest_approved_bid(auction, current_player)).data if current_player and highest_approved_bid(auction, current_player) else None,
+        "current_bid": BidSerializer(current_bid).data if current_bid else None,
         "current_player_bids": BidSerializer(current_player_bids, many=True).data,
         "pending_bids": BidSerializer(pending, many=True).data,
         "bid_feed": BidSerializer(bid_feed, many=True).data,
@@ -649,7 +657,7 @@ class AuctionViewSet(viewsets.ModelViewSet):
         amount = Decimal(str(request.data.get("bid_amount") or request.data.get("amount") or "0"))
         if amount > team.remaining_purse:
             raise ValidationError({"bid_amount": "Team does not have enough remaining points."})
-        current = highest_approved_bid(auction, player)
+        current = highest_active_bid(auction, player)
         minimum = (current.bid_amount if current else player.base_price) + (auction.bid_increment if current else Decimal("0"))
         if amount < minimum:
             raise ValidationError({"bid_amount": f"Bid must be at least {minimum}."})
