@@ -87,7 +87,7 @@ class Auction(models.Model):
     logo_url = models.URLField(blank=True)
     unit = models.CharField(max_length=24, blank=True, default="")
     purse_amount = models.DecimalField(max_digits=14, decimal_places=2, default=0)
-    bid_increment = models.DecimalField(max_digits=14, decimal_places=2, default=100000)
+    bid_increment = models.DecimalField(max_digits=14, decimal_places=2, default=1)
     timer_duration = models.PositiveIntegerField(default=30)
     minimum_players_per_team = models.PositiveIntegerField(default=0)
     maximum_players_per_team = models.PositiveIntegerField(default=0)
