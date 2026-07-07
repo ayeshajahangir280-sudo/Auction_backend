@@ -504,6 +504,26 @@ class AuctionViewSet(viewsets.ModelViewSet):
         )
         return Response(serialize_live_state(auction))
 
+    @transaction.atomic
+    @action(detail=True, methods=["post"], url_path="complete-auction")
+    def complete_auction(self, request, auction_id=None):
+        require_auction_staff(request.user)
+        auction = self.get_object()
+        auction.players.filter(status__in=[Player.Status.AVAILABLE, Player.Status.IN_AUCTION]).update(
+            status=Player.Status.UNSOLD
+        )
+        auction.current_player = None
+        auction.status = Auction.Status.COMPLETED
+        auction.sold_animation_state = False
+        auction.save(update_fields=["current_player", "status", "sold_animation_state"])
+        AuctionLog.objects.create(
+            auction=auction,
+            actor=request.user,
+            action="auction.completed",
+            message="Auction was marked completed.",
+        )
+        return Response(serialize_live_state(auction))
+
     @action(detail=True, methods=["post"], url_path="set-current-player")
     def set_current_player(self, request, auction_id=None):
         require_auction_staff(request.user)

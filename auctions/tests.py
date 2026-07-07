@@ -132,6 +132,34 @@ class AuctionWorkflowTests(TestCase):
         hidden_response = self.client.get(f"/api/auctions/{self.other_auction.auction_id}/live-state/")
         self.assertEqual(hidden_response.status_code, 404)
 
+    def test_complete_auction_marks_remaining_players_unsold(self):
+        current_player = self.players[0]
+        current_player.status = Player.Status.IN_AUCTION
+        current_player.save(update_fields=["status"])
+        self.players[1].status = Player.Status.SOLD
+        self.players[1].sold_team = self.team
+        self.players[1].sold_price = Decimal("150")
+        self.players[1].save(update_fields=["status", "sold_team", "sold_price"])
+        self.auction.current_player = current_player
+        self.auction.status = Auction.Status.LIVE
+        self.auction.save(update_fields=["current_player", "status"])
+
+        response = self.client.post(
+            f"/api/auctions/{self.auction.auction_id}/complete-auction/",
+            {},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.auction.refresh_from_db()
+        self.assertEqual(self.auction.status, Auction.Status.COMPLETED)
+        self.assertIsNone(self.auction.current_player)
+        self.assertEqual(response.data["auction"]["status"], Auction.Status.COMPLETED)
+        self.assertEqual(
+            list(self.auction.players.order_by("pk").values_list("status", flat=True)),
+            [Player.Status.UNSOLD, Player.Status.SOLD, Player.Status.UNSOLD],
+        )
+
     @override_settings(DEBUG=True, CORS_ALLOWED_ORIGIN_REGEXES=LOCAL_DEV_CORS_ALLOWED_ORIGIN_REGEXES)
     def test_private_lan_frontend_origin_can_read_public_auction(self):
         origin = "http://192.168.1.10:8080"
