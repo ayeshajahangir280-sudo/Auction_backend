@@ -4,10 +4,13 @@ import uuid
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
+from django.conf import settings
 from django.contrib.auth import authenticate, get_user_model
+from django.core.files.base import ContentFile
 from django.core.files.storage import default_storage
 from django.db import transaction
 from django.db.models import Count, F, Sum
+from django.http import Http404, HttpResponse
 from openpyxl import load_workbook
 from rest_framework import mixins, status, viewsets
 from rest_framework.decorators import action
@@ -17,7 +20,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 from rest_framework_simplejwt.tokens import RefreshToken
 
-from .models import Auction, AuctionLog, Bid, Category, Player, RoleProfile, SoldPlayer, Sponsor, Team, TeamCategoryLimit, TeamOwner
+from .models import Auction, AuctionLog, Bid, Category, Player, RoleProfile, SoldPlayer, Sponsor, Team, TeamCategoryLimit, TeamOwner, UploadedImage
 from .permissions import is_auction_manager, is_super_admin, is_team_owner, scoped_auction_for_user
 from .serializers import (
     AuctionLogSerializer,
@@ -33,6 +36,39 @@ from .serializers import (
 )
 
 User = get_user_model()
+
+MISSING_IMAGE_SVG = b"""<svg xmlns="http://www.w3.org/2000/svg" width="320" height="240" viewBox="0 0 320 240"><rect width="320" height="240" fill="#e7edf8"/><path d="M70 158l48-56 42 48 26-30 64 74H70z" fill="#b8c7df"/><circle cx="226" cy="78" r="22" fill="#c9d6ea"/><text x="160" y="218" text-anchor="middle" font-family="Arial, sans-serif" font-size="18" font-weight="700" fill="#48618a">Image unavailable</text></svg>"""
+
+
+def build_media_url(request, path: str) -> str:
+    media_url = settings.MEDIA_URL if settings.MEDIA_URL.startswith("/") else f"/{settings.MEDIA_URL}"
+    return request.build_absolute_uri(f"{media_url.rstrip('/')}/{path.lstrip('/')}")
+
+
+def serve_uploaded_media(request, path: str):
+    clean_path = path.lstrip("/")
+    uploaded_image = UploadedImage.objects.filter(path=clean_path).first()
+    if uploaded_image:
+        response = HttpResponse(bytes(uploaded_image.data), content_type=uploaded_image.content_type)
+        response["Cache-Control"] = "public, max-age=31536000, immutable"
+        response["Content-Length"] = str(uploaded_image.size)
+        return response
+
+    if default_storage.exists(clean_path):
+        with default_storage.open(clean_path, "rb") as stored_file:
+            data = stored_file.read()
+        content_type = "image/svg+xml" if clean_path.lower().endswith(".svg") else "image/jpeg"
+        response = HttpResponse(data, content_type=content_type)
+        response["Cache-Control"] = "public, max-age=86400"
+        response["Content-Length"] = str(len(data))
+        return response
+
+    if clean_path.lower().startswith("uploads/images/"):
+        response = HttpResponse(MISSING_IMAGE_SVG, content_type="image/svg+xml")
+        response["Cache-Control"] = "no-store"
+        return response
+
+    raise Http404("Media file not found.")
 
 PLAYER_IMPORT_HEADER_ALIASES = {
     "first": "first_name",
@@ -351,9 +387,16 @@ class ImageUploadView(APIView):
         suffix = Path(uploaded_file.name).suffix.lower()
         if suffix not in {".jpg", ".jpeg", ".png", ".gif", ".webp", ".avif", ".svg"}:
             suffix = ".jpg"
-        saved_path = default_storage.save(f"uploads/images/{uuid.uuid4().hex}{suffix}", uploaded_file)
-        file_url = default_storage.url(saved_path)
-        absolute_url = request.build_absolute_uri(file_url if file_url.startswith("/") else f"/{file_url}")
+        file_data = uploaded_file.read()
+        saved_path = f"uploads/images/{uuid.uuid4().hex}{suffix}"
+        default_storage.save(saved_path, ContentFile(file_data))
+        UploadedImage.objects.create(
+            path=saved_path,
+            content_type=content_type,
+            data=file_data,
+            size=len(file_data),
+        )
+        absolute_url = build_media_url(request, saved_path)
         return Response({"url": absolute_url, "path": saved_path}, status=status.HTTP_201_CREATED)
 
 
@@ -711,6 +754,13 @@ class AuctionViewSet(viewsets.ModelViewSet):
             .order_by("-updated_at", "-created_at")
             .first()
         )
+        if not auction:
+            auction = (
+                self.get_queryset()
+                .exclude(status=Auction.Status.ARCHIVED)
+                .order_by("-updated_at", "-created_at")
+                .first()
+            )
         if not auction:
             return Response({"detail": "No active auction is available."}, status=status.HTTP_404_NOT_FOUND)
         return Response(serialize_live_state(auction))

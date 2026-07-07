@@ -9,6 +9,20 @@ def make_code(prefix: str) -> str:
     return f"{prefix}-{uuid.uuid4().hex[:8].upper()}"
 
 
+class UploadedImage(models.Model):
+    path = models.CharField(max_length=255, unique=True)
+    content_type = models.CharField(max_length=80, default="image/jpeg")
+    data = models.BinaryField()
+    size = models.PositiveIntegerField(default=0)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+
+    def __str__(self) -> str:
+        return self.path
+
+
 class RoleProfile(models.Model):
     class Role(models.TextChoices):
         SUPER_ADMIN = "super_admin", "Super Admin"

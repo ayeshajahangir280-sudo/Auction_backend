@@ -12,6 +12,7 @@ from .models import (
     Sponsor,
     Team,
     TeamOwner,
+    UploadedImage,
 )
 
 
@@ -32,3 +33,4 @@ admin.site.register(TeamOwner)
 admin.site.register(Bid)
 admin.site.register(SoldPlayer)
 admin.site.register(AuctionLog)
+admin.site.register(UploadedImage)
