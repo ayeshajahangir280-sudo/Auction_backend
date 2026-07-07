@@ -75,7 +75,7 @@ TEMPLATES = [
 
 WSGI_APPLICATION = "config.wsgi.application"
 
-database_url = os.getenv("SUPABASE_DB_URL") or os.getenv("DATABASE_URL")
+database_url = os.getenv("DATABASE_URL")
 if database_url:
     DATABASES = {
         "default": dj_database_url.parse(database_url, conn_max_age=600),

@@ -14,7 +14,7 @@ python manage.py seed_demo
 python manage.py runserver 8000
 ```
 
-The local `.env` is read automatically. Use `SUPABASE_DB_URL` or `DATABASE_URL` for PostgreSQL/Supabase. If no PostgreSQL URL is provided, the backend uses local SQLite for development.
+The local `.env` is read automatically. Use `DATABASE_URL` for PostgreSQL. If no database URL is provided, the backend uses local SQLite for development.
 
 ## Demo Accounts
 
