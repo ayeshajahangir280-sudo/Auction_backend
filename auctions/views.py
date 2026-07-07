@@ -11,6 +11,7 @@ from django.core.files.storage import default_storage
 from django.db import transaction
 from django.db.models import Count, F, Sum
 from django.http import Http404, HttpResponse
+from django.utils import timezone
 from openpyxl import load_workbook
 from rest_framework import mixins, status, viewsets
 from rest_framework.decorators import action
@@ -257,6 +258,40 @@ def validate_team_player_limits(team: Team, player: Player) -> None:
     if team.maximum_players and team.players.count() >= team.maximum_players:
         raise ValidationError({"team": f"{team.short_name} already has the maximum squad of {team.maximum_players} players."})
     validate_team_category_limit(team, player)
+
+
+def sell_current_player_to_team(
+    auction: Auction,
+    player: Player,
+    team: Team,
+    sold_price: Decimal,
+    actor=None,
+    winning_bid: Bid | None = None,
+) -> None:
+    if player.status == Player.Status.SOLD:
+        return
+    validate_team_player_limits(team, player)
+    if sold_price > team.remaining_purse:
+        raise ValidationError({"sold_price": "Winning team does not have enough remaining purse."})
+
+    player.status = Player.Status.SOLD
+    player.sold_team = team
+    player.sold_price = sold_price
+    player.save(update_fields=["status", "sold_team", "sold_price"])
+    team.remaining_purse -= sold_price
+    team.players_bought += 1
+    team.save(update_fields=["remaining_purse", "players_bought"])
+    SoldPlayer.objects.update_or_create(
+        auction=auction,
+        player=player,
+        defaults={"team": team, "sold_price": sold_price},
+    )
+    pending_bids = Bid.objects.filter(auction=auction, player=player, bid_status=Bid.Status.PENDING)
+    if winning_bid:
+        pending_bids = pending_bids.exclude(pk=winning_bid.pk)
+    pending_bids.update(bid_status=Bid.Status.REJECTED, approved_by_admin=actor, approved_at=timezone.now())
+    AuctionLog.objects.create(auction=auction, actor=actor, action="player.sold", message=f"{player.full_name} sold to {team.short_name}.")
+    advance_to_random_player(auction, actor)
 
 
 def build_results(auction: Auction) -> dict:
@@ -531,14 +566,14 @@ class AuctionViewSet(viewsets.ModelViewSet):
     def start_auction(self, request, auction_id=None):
         require_auction_staff(request.user)
         auction = self.get_object()
-        if not auction.players.filter(status=Player.Status.AVAILABLE).exists() and not auction.current_player:
+        current_player_is_live = auction.current_player and auction.current_player.status == Player.Status.IN_AUCTION
+        if not auction.players.filter(status=Player.Status.AVAILABLE).exists() and not current_player_is_live:
             raise ValidationError({"players": "Add available players before starting the auction."})
-        if auction.current_player:
+        if current_player_is_live:
             auction.status = Auction.Status.LIVE
             auction.save(update_fields=["status"])
-        else:
-            if not advance_to_random_player(auction, request.user):
-                raise ValidationError({"players": "No available players left to start."})
+        elif not advance_to_random_player(auction, request.user):
+            raise ValidationError({"players": "No available players left to start."})
         AuctionLog.objects.create(
             auction=auction,
             actor=request.user,
@@ -648,6 +683,15 @@ class AuctionViewSet(viewsets.ModelViewSet):
         bid = auction.bids.get(pk=bid_pk)
         bid.approve(request.user)
         AuctionLog.objects.create(auction=auction, actor=request.user, action="bid.approved", message=f"Approved {bid.team.short_name} bid.")
+        if auction.current_player_id == bid.player_id:
+            sell_current_player_to_team(
+                auction,
+                bid.player,
+                bid.team,
+                bid.bid_amount,
+                actor=request.user,
+                winning_bid=bid,
+            )
         return Response(serialize_live_state(auction))
 
     @action(detail=True, methods=["post"], url_path=r"bids/(?P<bid_pk>[^/.]+)/reject")
@@ -676,26 +720,15 @@ class AuctionViewSet(viewsets.ModelViewSet):
             team = winning_bid.team
         if not team:
             raise ValidationError({"team": "Approve a bid or choose a winning team."})
-        validate_team_player_limits(team, player)
         sold_price = Decimal(str(request.data.get("sold_price") or request.data.get("amount") or (winning_bid.bid_amount if winning_bid else player.base_price)))
-        if sold_price > team.remaining_purse:
-            raise ValidationError({"sold_price": "Winning team does not have enough remaining purse."})
-
-        player.status = Player.Status.SOLD
-        player.sold_team = team
-        player.sold_price = sold_price
-        player.save(update_fields=["status", "sold_team", "sold_price"])
-        team.remaining_purse -= sold_price
-        team.players_bought += 1
-        team.save(update_fields=["remaining_purse", "players_bought"])
-        SoldPlayer.objects.update_or_create(
-            auction=auction,
-            player=player,
-            defaults={"team": team, "sold_price": sold_price},
+        sell_current_player_to_team(
+            auction,
+            player,
+            team,
+            sold_price,
+            actor=request.user,
+            winning_bid=winning_bid,
         )
-        auction.sold_animation_state = True
-        auction.save(update_fields=["sold_animation_state"])
-        AuctionLog.objects.create(auction=auction, actor=request.user, action="player.sold", message=f"{player.full_name} sold to {team.short_name}.")
         return Response(serialize_live_state(auction))
 
     @action(detail=True, methods=["post"], url_path="mark-unsold")
