@@ -111,15 +111,20 @@ DEPLOYED_CORS_ALLOWED_ORIGINS = [
     "https://cricket-auction-hub-three.vercel.app",
     "https://auction-apex.vercel.app",
 ]
-CORS_ALLOWED_ORIGINS = sorted(
-    {
-        *DEPLOYED_CORS_ALLOWED_ORIGINS,
-        *[
-            origin.strip()
-            for origin in os.getenv("CORS_ALLOWED_ORIGINS", "").split(",")
-            if origin.strip()
-        ],
-    }
+CORS_ALLOW_ALL_ORIGINS = os.getenv("CORS_ALLOW_ALL_ORIGINS", "True").lower() in {"1", "true", "yes", "on"}
+CORS_ALLOWED_ORIGINS = (
+    []
+    if CORS_ALLOW_ALL_ORIGINS
+    else sorted(
+        {
+            *DEPLOYED_CORS_ALLOWED_ORIGINS,
+            *[
+                origin.strip()
+                for origin in os.getenv("CORS_ALLOWED_ORIGINS", "").split(",")
+                if origin.strip()
+            ],
+        }
+    )
 )
 LOCAL_DEV_CORS_ALLOWED_ORIGIN_REGEXES = [
     r"^https?://localhost:\d+$",
@@ -128,7 +133,7 @@ LOCAL_DEV_CORS_ALLOWED_ORIGIN_REGEXES = [
     r"^https?://10\.\d{1,3}\.\d{1,3}\.\d{1,3}:\d+$",
     r"^https?://172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}:\d+$",
 ]
-CORS_ALLOWED_ORIGIN_REGEXES = LOCAL_DEV_CORS_ALLOWED_ORIGIN_REGEXES if DEBUG else []
+CORS_ALLOWED_ORIGIN_REGEXES = [] if CORS_ALLOW_ALL_ORIGINS else (LOCAL_DEV_CORS_ALLOWED_ORIGIN_REGEXES if DEBUG else [])
 CORS_ALLOW_CREDENTIALS = True
 
 SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
