@@ -29,8 +29,9 @@ After `seed_demo`:
 - `POST /api/auth/login/`
 - `GET /api/auth/me/`
 - `GET/POST /api/auctions/`
-- `GET/POST /api/categories/`
+- `GET /api/categories/` (read-only; categories are created from player imports)
 - `GET/POST /api/players/`
+- `POST /api/players/import-excel/`
 - `GET/POST /api/teams/`
 - `GET /api/auctions/{auction_id}/live-state/`
 - `POST /api/auctions/{auction_id}/set-current-player/`
@@ -40,6 +41,7 @@ After `seed_demo`:
 - `POST /api/auctions/{auction_id}/bids/{bid_id}/approve/`
 - `POST /api/auctions/{auction_id}/bids/{bid_id}/reject/`
 - `POST /api/auctions/{auction_id}/sell-player/`
+- `POST /api/auctions/{auction_id}/mark-unsold/`
 - `POST /api/auctions/{auction_id}/next-player/`
 - `GET /api/auctions/{auction_id}/team-roster/?team_id=TEAM-BOM`
 - `GET /api/auctions/{auction_id}/sold-players/`

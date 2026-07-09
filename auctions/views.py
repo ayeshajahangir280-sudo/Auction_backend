@@ -1,5 +1,7 @@
 import csv
+import json
 import re
+import time
 import uuid
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
@@ -9,8 +11,8 @@ from django.contrib.auth import authenticate, get_user_model
 from django.core.files.base import ContentFile
 from django.core.files.storage import default_storage
 from django.db import transaction
-from django.db.models import Count, F, Sum
-from django.http import Http404, HttpResponse
+from django.db.models import Count, F, Prefetch, Sum
+from django.http import Http404, HttpResponse, StreamingHttpResponse
 from django.utils import timezone
 from openpyxl import load_workbook
 from rest_framework import mixins, status, viewsets
@@ -23,6 +25,7 @@ from rest_framework_simplejwt.tokens import RefreshToken
 
 from .models import Auction, AuctionLog, Bid, Category, Player, RoleProfile, SoldPlayer, Sponsor, Team, TeamCategoryLimit, TeamOwner, UploadedImage
 from .permissions import is_auction_manager, is_super_admin, is_team_owner, scoped_auction_for_user
+from .pdf import build_team_roster_pdf, team_roster_pdf_filename
 from .serializers import (
     AuctionLogSerializer,
     AuctionSerializer,
@@ -204,16 +207,43 @@ def resolve_import_role(value) -> str:
     return role
 
 
-def resolve_import_category(auction: Auction, value):
+def normalize_category_display_name(value) -> str:
+    return re.sub(r"\s+", " ", clean_import_cell(value)).strip()
+
+
+def normalize_category_lookup_key(value) -> str:
+    return normalize_category_display_name(value).casefold()
+
+
+def resolve_import_category(auction: Auction, value, base_value: Decimal | None = None):
     text = clean_import_cell(value)
-    if not text:
-        return None
-    category = auction.categories.filter(category_id__iexact=text).first() or auction.categories.filter(name__iexact=text).first()
+    category_name = normalize_category_display_name(text)
+    if not category_name:
+        return None, False
+
+    category = auction.categories.filter(category_id__iexact=text).first()
     if not category and text.isdigit():
         category = auction.categories.filter(pk=int(text)).first()
+
+    lookup_key = normalize_category_lookup_key(category_name)
     if not category:
-        raise ValueError(f"Category '{text}' was not found.")
-    return category
+        for existing_category in auction.categories.all():
+            if normalize_category_lookup_key(existing_category.name) == lookup_key:
+                category = existing_category
+                break
+
+    if category:
+        if base_value and base_value > 0 and category.base_value == 0:
+            category.base_value = base_value
+            category.save(update_fields=["base_value"])
+        return category, False
+
+    category = Category.objects.create(
+        auction=auction,
+        name=category_name[:120],
+        base_value=base_value or Decimal("0"),
+    )
+    return category, True
 
 
 def user_can_access_auction(user, auction: Auction) -> bool:
@@ -228,15 +258,47 @@ def require_auction_staff(user) -> None:
         raise PermissionDenied("Only Super Admin or the assigned auction manager can perform this action.")
 
 
+def prevent_live_cache(response):
+    response["Cache-Control"] = "no-store, no-cache, must-revalidate, max-age=0"
+    response["Pragma"] = "no-cache"
+    response["Expires"] = "0"
+    return response
+
+
+def live_response(data, status_code=status.HTTP_200_OK):
+    return prevent_live_cache(Response(data, status=status_code))
+
+
+def bump_live_revision(auction: Auction) -> None:
+    Auction.objects.filter(pk=auction.pk).update(live_revision=F("live_revision") + 1, updated_at=timezone.now())
+    auction.refresh_from_db(fields=["live_revision", "updated_at"])
+
+
+def sse_event(event: str, data: dict, event_id: str | int | None = None) -> str:
+    lines = []
+    if event_id is not None:
+        lines.append(f"id: {event_id}")
+    lines.append(f"event: {event}")
+    lines.append(f"data: {json.dumps(data, separators=(',', ':'))}")
+    return "\n".join(lines) + "\n\n"
+
+
+def sse_response(stream):
+    response = StreamingHttpResponse(stream, content_type="text/event-stream")
+    prevent_live_cache(response)
+    response["X-Accel-Buffering"] = "no"
+    return response
+
+
 def highest_approved_bid(auction: Auction, player: Player | None = None):
-    qs = auction.bids.filter(bid_status=Bid.Status.APPROVED)
+    qs = auction.bids.select_related("player", "player__category", "team").filter(bid_status=Bid.Status.APPROVED)
     if player:
         qs = qs.filter(player=player)
     return qs.order_by("-bid_amount", "-approved_at", "-created_at").first()
 
 
 def highest_active_bid(auction: Auction, player: Player | None = None):
-    qs = auction.bids.filter(bid_status__in=[Bid.Status.PENDING, Bid.Status.APPROVED])
+    qs = auction.bids.select_related("player", "player__category", "team").filter(bid_status__in=[Bid.Status.PENDING, Bid.Status.APPROVED])
     if player:
         qs = qs.filter(player=player)
     return qs.order_by("-bid_amount", "-created_at").first()
@@ -244,27 +306,54 @@ def highest_active_bid(auction: Auction, player: Player | None = None):
 
 def remaining_required_points(team: Team) -> Decimal:
     total = Decimal("0")
-    for limit in team.category_limits.select_related("category"):
-        bought_count = team.players.filter(category=limit.category).count()
+    cache = getattr(team, "_prefetched_objects_cache", {})
+    limits = cache.get("category_limits")
+    if limits is None:
+        limits = team.category_limits.select_related("category")
+    for limit in limits:
+        prefetched_players = cache.get("players")
+        if prefetched_players is None:
+            bought_count = team.players.filter(category=limit.category).count()
+        else:
+            bought_count = sum(1 for player in prefetched_players if player.category_id == limit.category_id)
         total += limit.category.base_value * max(limit.maximum_players - bought_count, 0)
     return total
 
 
-def validate_team_category_limit(team: Team, player: Player) -> None:
+def team_category_limit_message(team: Team, player: Player) -> str:
     if not player.category_id:
-        return
+        return ""
     limit = team.category_limits.filter(category=player.category).first()
     if not limit or limit.maximum_players == 0:
-        return
+        return ""
     bought_count = team.players.filter(category=player.category).count()
     if bought_count >= limit.maximum_players:
-        raise ValidationError({"category": f"{team.short_name} already has the maximum players for {player.category.name}."})
+        return (
+            f"Category limit reached: {team.short_name} already has the maximum players "
+            f"for {player.category.name} ({bought_count}/{limit.maximum_players})."
+        )
+    return ""
+
+
+def team_player_limit_message(team: Team, player: Player) -> tuple[str, str]:
+    if team.maximum_players and team.players.count() >= team.maximum_players:
+        return "team", f"{team.short_name} already has the maximum squad of {team.maximum_players} players."
+    category_message = team_category_limit_message(team, player)
+    if category_message:
+        return "category", category_message
+    return "", ""
+
+
+def validate_team_category_limit(team: Team, player: Player) -> None:
+    message = team_category_limit_message(team, player)
+    if message:
+        raise ValidationError({"category": message})
 
 
 def validate_team_player_limits(team: Team, player: Player) -> None:
-    if team.maximum_players and team.players.count() >= team.maximum_players:
-        raise ValidationError({"team": f"{team.short_name} already has the maximum squad of {team.maximum_players} players."})
-    validate_team_category_limit(team, player)
+    field, message = team_player_limit_message(team, player)
+    if message:
+        raise ValidationError({field: message})
 
 
 def sell_current_player_to_team(
@@ -297,19 +386,31 @@ def sell_current_player_to_team(
     if winning_bid:
         pending_bids = pending_bids.exclude(pk=winning_bid.pk)
     pending_bids.update(bid_status=Bid.Status.REJECTED, approved_by_admin=actor, approved_at=timezone.now())
+    if auction.current_player_id == player.pk:
+        auction.current_player = None
+        auction.sold_animation_state = False
+        auction.save(update_fields=["current_player", "sold_animation_state"])
+    bump_live_revision(auction)
     AuctionLog.objects.create(auction=auction, actor=actor, action="player.sold", message=f"{player.full_name} sold to {team.short_name}.")
-    advance_to_random_player(auction, actor)
 
 
-def build_results(auction: Auction) -> dict:
-    sold_qs = auction.sold_players.select_related("player", "team")
+def live_team_queryset(auction: Auction):
+    return auction.teams.prefetch_related(
+        Prefetch("category_limits", queryset=TeamCategoryLimit.objects.select_related("category")),
+        Prefetch("players", queryset=Player.objects.only("id", "sold_team_id", "category_id")),
+    )
+
+
+def build_results(auction: Auction, teams=None) -> dict:
+    sold_qs = auction.sold_players.select_related("player", "player__category", "team")
     sold_count = sold_qs.count()
     total_spend = sold_qs.aggregate(total=Sum("sold_price"))["total"] or Decimal("0")
     top_sale = sold_qs.order_by("-sold_price").first()
-    teams = []
-    for team in auction.teams.annotate(roster_count=Count("players")).order_by("name"):
+    result_teams = []
+    team_iterable = teams if teams is not None else auction.teams.annotate(roster_count=Count("players")).order_by("name")
+    for team in team_iterable:
         required = remaining_required_points(team)
-        teams.append(
+        result_teams.append(
             {
                 "team_id": team.team_id,
                 "name": team.name,
@@ -327,28 +428,38 @@ def build_results(auction: Auction) -> dict:
         "available_count": auction.players.filter(status=Player.Status.AVAILABLE).count(),
         "total_spend": total_spend,
         "top_sale": SoldPlayerSerializer(top_sale).data if top_sale else None,
-        "teams": teams,
+        "teams": result_teams,
     }
 
 
 def serialize_live_state(auction: Auction, team_scope: Team | None = None) -> dict:
     current_player = auction.current_player
     current_player_bids = (
-        auction.bids.select_related("player", "team")
+        auction.bids.select_related("player", "player__category", "team")
         .filter(player=current_player, bid_status__in=[Bid.Status.PENDING, Bid.Status.APPROVED])
         .order_by("-bid_amount", "-created_at")
         if current_player
         else Bid.objects.none()
     )
-    bid_feed = auction.bids.select_related("player", "team").filter(bid_status=Bid.Status.APPROVED)[:20]
-    pending_qs = auction.bids.select_related("player", "team").filter(bid_status=Bid.Status.PENDING).order_by("-bid_amount", "-created_at")
-    teams_qs = auction.teams.all()
-    sold_players_qs = auction.sold_players.select_related("player", "team")
-    results = build_results(auction)
+    bid_feed = (
+        auction.bids.select_related("player", "player__category", "team")
+        .filter(bid_status=Bid.Status.APPROVED)
+        .order_by("-created_at")[:20]
+    )
+    pending_qs = (
+        auction.bids.select_related("player", "player__category", "team")
+        .filter(bid_status=Bid.Status.PENDING)
+        .order_by("-bid_amount", "-created_at")
+    )
+    teams_qs = live_team_queryset(auction).order_by("name")
+    sold_players_qs = auction.sold_players.select_related("player", "player__category", "team")
     if team_scope:
         pending_qs = pending_qs.filter(team=team_scope)
         teams_qs = teams_qs.filter(pk=team_scope.pk)
         sold_players_qs = sold_players_qs.filter(team=team_scope)
+    teams = list(teams_qs)
+    results = build_results(auction, teams=teams)
+    if team_scope:
         results["teams"] = [team for team in results["teams"] if team["team_id"] == team_scope.team_id]
         if results["top_sale"] and results["top_sale"]["team"] != team_scope.pk:
             results["top_sale"] = None
@@ -357,7 +468,7 @@ def serialize_live_state(auction: Auction, team_scope: Team | None = None) -> di
     return {
         "auction": AuctionSerializer(auction).data,
         "current_player": PlayerSerializer(current_player).data if current_player else None,
-        "teams": TeamSerializer(teams_qs, many=True).data,
+        "teams": TeamSerializer(teams, many=True).data,
         "current_bid": BidSerializer(current_bid).data if current_bid else None,
         "current_player_bids": BidSerializer(current_player_bids, many=True).data,
         "pending_bids": BidSerializer(pending, many=True).data,
@@ -368,14 +479,22 @@ def serialize_live_state(auction: Auction, team_scope: Team | None = None) -> di
 
 
 def advance_to_random_player(auction: Auction, actor=None) -> Player | None:
-    auction.players.filter(status=Player.Status.IN_AUCTION).update(status=Player.Status.AVAILABLE)
-    next_player = auction.players.filter(status=Player.Status.AVAILABLE).order_by("?").first()
+    current_player_id = auction.current_player_id
+    next_player_qs = auction.players.filter(status=Player.Status.AVAILABLE)
+    if current_player_id:
+        next_player_qs = next_player_qs.exclude(pk=current_player_id)
+    next_player = next_player_qs.order_by("?").first()
     if not next_player:
+        current_player = auction.current_player
+        if current_player and current_player.status == Player.Status.IN_AUCTION:
+            return current_player
+        auction.players.filter(status=Player.Status.IN_AUCTION).update(status=Player.Status.AVAILABLE)
         auction.current_player = None
         auction.sold_animation_state = False
         auction.save(update_fields=["current_player", "sold_animation_state"])
         return None
 
+    auction.players.filter(status=Player.Status.IN_AUCTION).exclude(pk=next_player.pk).update(status=Player.Status.AVAILABLE)
     next_player.status = Player.Status.IN_AUCTION
     next_player.save(update_fields=["status"])
     auction.current_player = next_player
@@ -389,6 +508,67 @@ def advance_to_random_player(auction: Auction, actor=None) -> Player | None:
         message=f"{next_player.full_name} moved to the block randomly.",
     )
     return next_player
+
+
+def public_active_auction():
+    auction = (
+        Auction.objects.select_related("current_player", "current_player__category")
+        .prefetch_related("sponsors")
+        .filter(status__in=[Auction.Status.LIVE, Auction.Status.ACTIVE, Auction.Status.SETUP])
+        .order_by("-updated_at", "-created_at")
+        .first()
+    )
+    if auction:
+        return auction
+    return (
+        Auction.objects.select_related("current_player", "current_player__category")
+        .prefetch_related("sponsors")
+        .exclude(status=Auction.Status.ARCHIVED)
+        .order_by("-updated_at", "-created_at")
+        .first()
+    )
+
+
+def auction_revision_stream(auction_pk: int):
+    last_revision = Auction.objects.filter(pk=auction_pk).values_list("live_revision", flat=True).first()
+    yield "retry: 1500\n\n"
+    if last_revision is not None:
+        yield sse_event("revision", {"revision": last_revision}, last_revision)
+    last_heartbeat = time.monotonic()
+    while True:
+        revision = Auction.objects.filter(pk=auction_pk).values_list("live_revision", flat=True).first()
+        if revision is None:
+            yield sse_event("deleted", {"auction": None})
+            return
+        if revision != last_revision:
+            last_revision = revision
+            yield sse_event("revision", {"revision": revision}, revision)
+            last_heartbeat = time.monotonic()
+        elif time.monotonic() - last_heartbeat >= 15:
+            yield ": keepalive\n\n"
+            last_heartbeat = time.monotonic()
+        time.sleep(0.75)
+
+
+def public_active_revision_stream():
+    auction = public_active_auction()
+    last_token = f"{auction.auction_id}:{auction.live_revision}" if auction else ""
+    yield "retry: 1500\n\n"
+    if auction:
+        yield sse_event("revision", {"auction_id": auction.auction_id, "revision": auction.live_revision}, last_token)
+    last_heartbeat = time.monotonic()
+    while True:
+        auction = public_active_auction()
+        token = f"{auction.auction_id}:{auction.live_revision}" if auction else ""
+        if token != last_token:
+            last_token = token
+            payload = {"auction_id": auction.auction_id, "revision": auction.live_revision} if auction else {"auction_id": None}
+            yield sse_event("revision", payload, token or "none")
+            last_heartbeat = time.monotonic()
+        elif time.monotonic() - last_heartbeat >= 15:
+            yield ": keepalive\n\n"
+            last_heartbeat = time.monotonic()
+        time.sleep(0.75)
 
 
 class LoginView(APIView):
@@ -496,23 +676,23 @@ class ScopedModelViewSet(viewsets.ModelViewSet):
 
 
 class AuctionViewSet(viewsets.ModelViewSet):
-    queryset = Auction.objects.select_related("manager", "current_player").prefetch_related("sponsors", "teams", "players")
+    queryset = Auction.objects.select_related("manager", "current_player", "current_player__category").prefetch_related("sponsors", "teams", "players")
     serializer_class = AuctionSerializer
     lookup_field = "auction_id"
 
     def get_permissions(self):
-        public_actions = {"public_active", "public_live", "projector"}
+        public_actions = {"public_active", "public_live", "projector", "public_live_events", "public_active_events"}
         if self.action in public_actions:
             return [AllowAny()]
         return [IsAuthenticated()]
 
     def get_queryset(self):
         qs = super().get_queryset()
-        if self.action in {"public_active", "public_live", "projector"}:
+        if self.action in {"public_active", "public_live", "projector", "public_live_events", "public_active_events"}:
             return qs
         if is_super_admin(self.request.user):
             return qs
-        if is_team_owner(self.request.user) and self.action not in {"live_state", "team_owner_bid", "team_roster"}:
+        if is_team_owner(self.request.user) and self.action not in {"live_state", "team_owner_bid", "team_roster", "team_roster_pdf"}:
             return qs.none()
         auction = scoped_auction_for_user(self.request.user)
         return qs.filter(pk=auction.pk) if auction else qs.none()
@@ -563,7 +743,16 @@ class AuctionViewSet(viewsets.ModelViewSet):
     def live_state(self, request, auction_id=None):
         auction = self.get_object()
         team_scope = request.user.role_profile.team if is_team_owner(request.user) else None
-        return Response(serialize_live_state(auction, team_scope=team_scope))
+        return live_response(serialize_live_state(auction, team_scope=team_scope))
+
+    @action(detail=True, methods=["get"], url_path="public-live-events")
+    def public_live_events(self, request, auction_id=None):
+        auction = self.get_object()
+        return sse_response(auction_revision_stream(auction.pk))
+
+    @action(detail=False, methods=["get"], url_path="public-active-events")
+    def public_active_events(self, request):
+        return sse_response(public_active_revision_stream())
 
     @action(detail=True, methods=["get"], url_path="current-player")
     def current_player(self, request, auction_id=None):
@@ -588,7 +777,8 @@ class AuctionViewSet(viewsets.ModelViewSet):
             action="auction.started",
             message="Auction was started.",
         )
-        return Response(serialize_live_state(auction))
+        bump_live_revision(auction)
+        return live_response(serialize_live_state(auction))
 
     @transaction.atomic
     @action(detail=True, methods=["post"], url_path="complete-auction")
@@ -608,7 +798,8 @@ class AuctionViewSet(viewsets.ModelViewSet):
             action="auction.completed",
             message="Auction was marked completed.",
         )
-        return Response(serialize_live_state(auction))
+        bump_live_revision(auction)
+        return live_response(serialize_live_state(auction))
 
     @action(detail=True, methods=["post"], url_path="set-current-player")
     def set_current_player(self, request, auction_id=None):
@@ -618,6 +809,8 @@ class AuctionViewSet(viewsets.ModelViewSet):
         player = auction.players.filter(player_id=player_code).first() or auction.players.filter(pk=player_code).first()
         if not player:
             raise ValidationError({"player_id": "Player not found in this auction."})
+        if player.status in {Player.Status.SOLD, Player.Status.UNSOLD}:
+            raise ValidationError({"player_id": "Choose a player who is not sold or unsold."})
         auction.players.filter(status=Player.Status.IN_AUCTION).update(status=Player.Status.AVAILABLE)
         player.status = Player.Status.IN_AUCTION
         player.save(update_fields=["status"])
@@ -626,7 +819,8 @@ class AuctionViewSet(viewsets.ModelViewSet):
         auction.sold_animation_state = False
         auction.save(update_fields=["current_player", "status", "sold_animation_state"])
         AuctionLog.objects.create(auction=auction, actor=request.user, action="auction.current_player", message=f"{player.full_name} is now live.")
-        return Response(serialize_live_state(auction))
+        bump_live_revision(auction)
+        return live_response(serialize_live_state(auction))
 
     @action(detail=True, methods=["post"], url_path="manual-bid")
     def manual_bid(self, request, auction_id=None):
@@ -675,20 +869,25 @@ class AuctionViewSet(viewsets.ModelViewSet):
             action="bid.pending",
             message=f"{team.short_name} bid {amount} for {player.full_name}.",
         )
-        return Response(BidSerializer(bid).data, status=status.HTTP_201_CREATED)
+        bump_live_revision(auction)
+        return live_response(BidSerializer(bid).data, status.HTTP_201_CREATED)
 
     @action(detail=True, methods=["get"], url_path="pending-bids")
     def pending_bids(self, request, auction_id=None):
         require_auction_staff(request.user)
         auction = self.get_object()
-        bids = auction.bids.select_related("player", "team").filter(bid_status=Bid.Status.PENDING)
-        return Response(BidSerializer(bids, many=True).data)
+        bids = auction.bids.select_related("player", "player__category", "team").filter(bid_status=Bid.Status.PENDING)
+        return live_response(BidSerializer(bids, many=True).data)
 
+    @transaction.atomic
     @action(detail=True, methods=["post"], url_path=r"bids/(?P<bid_pk>[^/.]+)/approve")
     def approve_bid(self, request, auction_id=None, bid_pk=None):
         require_auction_staff(request.user)
         auction = self.get_object()
-        bid = auction.bids.get(pk=bid_pk)
+        bid = auction.bids.select_related("player", "team").get(pk=bid_pk)
+        validate_team_player_limits(bid.team, bid.player)
+        if bid.bid_amount > bid.team.remaining_purse:
+            raise ValidationError({"bid_amount": "Winning team does not have enough remaining purse."})
         bid.approve(request.user)
         AuctionLog.objects.create(auction=auction, actor=request.user, action="bid.approved", message=f"Approved {bid.team.short_name} bid.")
         if auction.current_player_id == bid.player_id:
@@ -700,7 +899,9 @@ class AuctionViewSet(viewsets.ModelViewSet):
                 actor=request.user,
                 winning_bid=bid,
             )
-        return Response(serialize_live_state(auction))
+        else:
+            bump_live_revision(auction)
+        return live_response(serialize_live_state(auction))
 
     @action(detail=True, methods=["post"], url_path=r"bids/(?P<bid_pk>[^/.]+)/reject")
     def reject_bid(self, request, auction_id=None, bid_pk=None):
@@ -709,7 +910,8 @@ class AuctionViewSet(viewsets.ModelViewSet):
         bid = auction.bids.get(pk=bid_pk)
         bid.reject(request.user)
         AuctionLog.objects.create(auction=auction, actor=request.user, action="bid.rejected", message=f"Rejected {bid.team.short_name} bid.")
-        return Response(BidSerializer(bid).data)
+        bump_live_revision(auction)
+        return live_response(BidSerializer(bid).data)
 
     @transaction.atomic
     @action(detail=True, methods=["post"], url_path="sell-player")
@@ -737,7 +939,7 @@ class AuctionViewSet(viewsets.ModelViewSet):
             actor=request.user,
             winning_bid=winning_bid,
         )
-        return Response(serialize_live_state(auction))
+        return live_response(serialize_live_state(auction))
 
     @action(detail=True, methods=["post"], url_path="mark-unsold")
     def mark_unsold(self, request, auction_id=None):
@@ -747,21 +949,48 @@ class AuctionViewSet(viewsets.ModelViewSet):
         if not player:
             raise ValidationError({"player": "No current player selected."})
         player.status = Player.Status.UNSOLD
-        player.save(update_fields=["status"])
+        player.sold_team = None
+        player.sold_price = None
+        player.save(update_fields=["status", "sold_team", "sold_price"])
+        auction.current_player = None
+        auction.sold_animation_state = False
+        auction.save(update_fields=["current_player", "sold_animation_state"])
+        Bid.objects.filter(auction=auction, player=player, bid_status=Bid.Status.PENDING).update(
+            bid_status=Bid.Status.REJECTED,
+            approved_by_admin=request.user,
+            approved_at=timezone.now(),
+        )
         AuctionLog.objects.create(auction=auction, actor=request.user, action="player.unsold", message=f"{player.full_name} marked unsold.")
-        advance_to_random_player(auction, request.user)
-        return Response(serialize_live_state(auction))
+        bump_live_revision(auction)
+        return live_response(serialize_live_state(auction))
 
     @action(detail=True, methods=["post"], url_path="next-player")
     def next_player(self, request, auction_id=None):
         require_auction_staff(request.user)
         auction = self.get_object()
         advance_to_random_player(auction, request.user)
-        return Response(serialize_live_state(auction))
+        bump_live_revision(auction)
+        return live_response(serialize_live_state(auction))
 
     @action(detail=True, methods=["get"], url_path="team-roster")
     def team_roster(self, request, auction_id=None):
         auction = self.get_object()
+        team = self._roster_team_for_request(request, auction)
+        players = auction.players.filter(sold_team=team).select_related("category", "sold_team")
+        return Response({"team": TeamSerializer(team).data, "players": PlayerSerializer(players, many=True).data})
+
+    @action(detail=True, methods=["get"], url_path="team-roster-pdf")
+    def team_roster_pdf(self, request, auction_id=None):
+        auction = self.get_object()
+        team = self._roster_team_for_request(request, auction)
+        pdf_data = build_team_roster_pdf(auction, team, request=request)
+        filename = f"{team_roster_pdf_filename(auction, team)}.pdf"
+        response = HttpResponse(pdf_data, content_type="application/pdf")
+        response["Content-Disposition"] = f'attachment; filename="{filename}"'
+        response["Content-Length"] = str(len(pdf_data))
+        return response
+
+    def _roster_team_for_request(self, request, auction: Auction) -> Team:
         if is_team_owner(request.user):
             team = request.user.role_profile.team
             if not team or team.auction_id != auction.pk:
@@ -771,123 +1000,64 @@ class AuctionViewSet(viewsets.ModelViewSet):
             team = auction.teams.filter(team_id=team_value).first() or auction.teams.filter(pk=team_value).first()
         if not team:
             raise ValidationError({"team": "Team is required."})
-        players = auction.players.filter(sold_team=team).select_related("category", "sold_team")
-        return Response({"team": TeamSerializer(team).data, "players": PlayerSerializer(players, many=True).data})
+        return team
 
     @action(detail=True, methods=["get"], url_path="sold-players")
     def sold_players(self, request, auction_id=None):
         auction = self.get_object()
-        return Response(SoldPlayerSerializer(auction.sold_players.select_related("player", "team"), many=True).data)
+        return live_response(SoldPlayerSerializer(auction.sold_players.select_related("player", "player__category", "team"), many=True).data)
 
     @action(detail=True, methods=["get"], url_path="results")
     def results(self, request, auction_id=None):
-        return Response(build_results(self.get_object()))
+        return live_response(build_results(self.get_object()))
 
     @action(detail=True, methods=["get"], url_path="public-live")
     def public_live(self, request, auction_id=None):
-        return Response(serialize_live_state(self.get_object()))
+        return live_response(serialize_live_state(self.get_object()))
 
     @action(detail=False, methods=["get"], url_path="public-active")
     def public_active(self, request):
-        auction = (
-            self.get_queryset()
-            .filter(status__in=[Auction.Status.LIVE, Auction.Status.ACTIVE, Auction.Status.SETUP])
-            .order_by("-updated_at", "-created_at")
-            .first()
-        )
-        if not auction:
-            auction = (
-                self.get_queryset()
-                .exclude(status=Auction.Status.ARCHIVED)
-                .order_by("-updated_at", "-created_at")
-                .first()
-            )
+        auction = public_active_auction()
         if not auction:
             return Response({"detail": "No active auction is available."}, status=status.HTTP_404_NOT_FOUND)
-        return Response(serialize_live_state(auction))
+        return live_response(serialize_live_state(auction))
 
     @action(detail=True, methods=["get"], url_path="projector")
     def projector(self, request, auction_id=None):
         state = serialize_live_state(self.get_object())
         state["mode"] = "projector"
-        return Response(state)
+        return live_response(state)
 
 
 class CategoryViewSet(ScopedModelViewSet):
     queryset = Category.objects.select_related("auction")
     serializer_class = CategorySerializer
-
-    def perform_create(self, serializer):
-        super().perform_create(serializer)
-        self.sync_category_players(serializer.instance)
-
-    def perform_update(self, serializer):
-        max_players = serializer.validated_data.get("maximum_players", serializer.instance.maximum_players)
-        if max_players and serializer.instance.players.count() > max_players:
-            raise ValidationError({"maximum_players": "This category already has more selected players than this max."})
-        super().perform_update(serializer)
-        self.sync_category_players(serializer.instance)
-
-    def sync_category_players(self, category):
-        category.players.update(base_price=category.base_value)
-
-    def perform_destroy(self, instance):
-        require_auction_staff(self.request.user)
-        if not user_can_access_auction(self.request.user, instance.auction):
-            raise PermissionDenied("You cannot delete this category.")
-        instance.players.update(category=None, base_price=0)
-        instance.delete()
-
-    @transaction.atomic
-    @action(detail=True, methods=["post"], url_path="assign-players")
-    def assign_players(self, request, pk=None):
-        require_auction_staff(request.user)
-        category = self.get_object()
-        raw_player_ids = request.data.get("player_ids", [])
-        if not isinstance(raw_player_ids, list):
-            raise ValidationError({"player_ids": "Send player_ids as a list."})
-        try:
-            player_ids = [int(player_id) for player_id in raw_player_ids]
-        except (TypeError, ValueError) as exc:
-            raise ValidationError({"player_ids": "Every player id must be a number."}) from exc
-
-        selected_players = category.auction.players.filter(pk__in=player_ids)
-        found_ids = set(selected_players.values_list("id", flat=True))
-        missing_ids = sorted(set(player_ids) - found_ids)
-        if missing_ids:
-            raise ValidationError({"player_ids": f"Players not found for this auction: {missing_ids}."})
-        if category.maximum_players and len(found_ids) > category.maximum_players:
-            raise ValidationError({"player_ids": f"Select at most {category.maximum_players} players for {category.name}."})
-
-        removed_count = category.players.exclude(pk__in=found_ids).update(category=None, base_price=0)
-        assigned_count = selected_players.update(category=category, base_price=category.base_value)
-        AuctionLog.objects.create(
-            auction=category.auction,
-            actor=request.user,
-            action="category.assign_players",
-            message=f"Assigned {assigned_count} players to {category.name}.",
-            metadata={"category_id": category.category_id, "assigned_count": assigned_count, "removed_count": removed_count},
-        )
-        return Response(
-            {
-                "category": CategorySerializer(category).data,
-                "assigned_count": assigned_count,
-                "removed_count": removed_count,
-            }
-        )
+    http_method_names = ["get", "head", "options"]
 
 
 class PlayerViewSet(ScopedModelViewSet):
     queryset = Player.objects.select_related("auction", "category", "sold_team")
     serializer_class = PlayerSerializer
 
+    def get_queryset(self):
+        qs = super().get_queryset()
+        player_status = self.request.query_params.get("status")
+        valid_statuses = {choice[0] for choice in Player.Status.choices}
+        if player_status in valid_statuses:
+            qs = qs.filter(status=player_status)
+        return qs
+
     def perform_create(self, serializer):
         super().perform_create(serializer)
-        self.sync_player_base_price(serializer.instance)
+        if "base_price" not in serializer.validated_data:
+            self.sync_player_base_price(serializer.instance)
 
     def perform_update(self, serializer):
+        old_category_id = serializer.instance.category_id
         super().perform_update(serializer)
-        self.sync_player_base_price(serializer.instance)
+        category_changed = "category" in serializer.validated_data and serializer.instance.category_id != old_category_id
+        if category_changed and "base_price" not in serializer.validated_data:
+            self.sync_player_base_price(serializer.instance)
 
     def sync_player_base_price(self, player):
         base_price = player.category.base_value if player.category else Decimal("0")
@@ -917,7 +1087,8 @@ class PlayerViewSet(ScopedModelViewSet):
         auction.sold_animation_state = False
         auction.save(update_fields=["current_player", "sold_animation_state"])
         auction.players.all().delete()
-        auction.teams.update(players_bought=0, remaining_purse=F("purse_amount"))
+        auction.teams.update(players_bought=0, purse_amount=auction.purse_amount, remaining_purse=auction.purse_amount)
+        bump_live_revision(auction)
         AuctionLog.objects.create(
             auction=auction,
             actor=request.user,
@@ -986,6 +1157,7 @@ class PlayerViewSet(ScopedModelViewSet):
                 return row[index]
 
             created_players = []
+            created_category_ids = set()
             errors = []
             for row_number, row in enumerate(rows, start=2):
                 if not any(clean_import_cell(cell) for cell in row):
@@ -1000,7 +1172,13 @@ class PlayerViewSet(ScopedModelViewSet):
                         last_name = " ".join(parts[1:])
                     if not first_name:
                         raise ValueError("Name or First Name is required.")
-                    category = resolve_import_category(auction, row_value(row, "category"))
+                    base_price_value = row_value(row, "base_price")
+                    base_price_text = clean_import_cell(base_price_value)
+                    imported_base_price = parse_import_decimal(base_price_value, "0") if base_price_text else Decimal("0")
+                    category, category_created = resolve_import_category(auction, row_value(row, "category"), imported_base_price)
+                    if category_created and category:
+                        created_category_ids.add(category.pk)
+                    player_base_price = imported_base_price if base_price_text else (category.base_value if category else Decimal("0"))
 
                     player = Player.objects.create(
                         auction=auction,
@@ -1011,7 +1189,7 @@ class PlayerViewSet(ScopedModelViewSet):
                         role=resolve_import_role(row_value(row, "role")),
                         country=clean_import_cell(row_value(row, "country"))[:80],
                         age=max(parse_import_int(row_value(row, "age"), 0), 0),
-                        base_price=category.base_value if category else Decimal("0"),
+                        base_price=player_base_price,
                         queue_order=max(parse_import_int(row_value(row, "queue_order"), 0), 0),
                     )
                     created_players.append(player)
@@ -1023,11 +1201,17 @@ class PlayerViewSet(ScopedModelViewSet):
                 actor=request.user,
                 action="players.import",
                 message=f"Imported {len(created_players)} players from import file.",
-                metadata={"file": uploaded_file.name, "created_count": len(created_players), "error_count": len(errors)},
+                metadata={
+                    "file": uploaded_file.name,
+                    "created_count": len(created_players),
+                    "created_category_count": len(created_category_ids),
+                    "error_count": len(errors),
+                },
             )
             return Response(
                 {
                     "created_count": len(created_players),
+                    "created_category_count": len(created_category_ids),
                     "error_count": len(errors),
                     "errors": errors[:50],
                     "players": PlayerSerializer(created_players[:25], many=True).data,
@@ -1071,7 +1255,7 @@ class TeamViewSet(ScopedModelViewSet):
             if category.pk in seen_categories:
                 raise ValidationError({"category": f"{category.name} was included more than once."})
             bought_count = team.players.filter(category=category).count()
-            if maximum_players < bought_count:
+            if maximum_players and maximum_players < bought_count:
                 raise ValidationError(
                     {
                         "maximum_players": (

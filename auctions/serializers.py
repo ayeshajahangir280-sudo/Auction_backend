@@ -88,6 +88,8 @@ class AuctionSerializer(serializers.ModelSerializer):
     team_count = serializers.IntegerField(source="teams.count", read_only=True)
     player_count = serializers.IntegerField(source="players.count", read_only=True)
     setup_enabled = serializers.SerializerMethodField()
+    purse = serializers.SerializerMethodField()
+    purse_type = serializers.SerializerMethodField()
 
     class Meta:
         model = Auction
@@ -107,12 +109,15 @@ class AuctionSerializer(serializers.ModelSerializer):
             "logo_url",
             "unit",
             "purse_amount",
+            "purse",
+            "purse_type",
             "bid_increment",
             "timer_duration",
             "minimum_players_per_team",
             "maximum_players_per_team",
             "current_player",
             "sold_animation_state",
+            "live_revision",
             "team_count",
             "player_count",
             "setup_enabled",
@@ -121,10 +126,25 @@ class AuctionSerializer(serializers.ModelSerializer):
             "created_at",
             "updated_at",
         ]
-        read_only_fields = ["id", "auction_id", "current_player", "created_at", "updated_at"]
+        read_only_fields = ["id", "auction_id", "current_player", "live_revision", "created_at", "updated_at"]
 
     def get_setup_enabled(self, obj) -> bool:
         return bool(obj.pk)
+
+    def get_purse(self, obj):
+        return str(obj.purse_amount)
+
+    def get_purse_type(self, obj):
+        return obj.unit
+
+    def to_internal_value(self, data):
+        if hasattr(data, "copy"):
+            data = data.copy()
+        if "purse" in data and "purse_amount" not in data:
+            data["purse_amount"] = data["purse"]
+        if "purse_type" in data and "unit" not in data:
+            data["unit"] = data["purse_type"]
+        return super().to_internal_value(data)
 
     @transaction.atomic
     def create(self, validated_data):
@@ -152,6 +172,37 @@ class AuctionSerializer(serializers.ModelSerializer):
                 },
             )
         return auction
+
+    @transaction.atomic
+    def update(self, instance, validated_data):
+        username = validated_data.pop("manager_username", "").strip()
+        password = validated_data.pop("manager_password", "").strip()
+        purse_was_updated = "purse_amount" in validated_data
+
+        if username:
+            manager, _ = User.objects.get_or_create(username=username)
+            if password:
+                manager.set_password(password)
+            elif not manager.has_usable_password():
+                manager.set_password(User.objects.make_random_password())
+            manager.save()
+            instance.manager = manager
+
+        for key, value in validated_data.items():
+            setattr(instance, key, value)
+        instance.save()
+
+        if purse_was_updated:
+            self._sync_team_purses(instance)
+
+        return instance
+
+    def _sync_team_purses(self, auction: Auction) -> None:
+        for team in auction.teams.prefetch_related("sold_players"):
+            sold_total = sum((sold.sold_price for sold in team.sold_players.all()), Decimal("0"))
+            team.purse_amount = auction.purse_amount
+            team.remaining_purse = auction.purse_amount - sold_total
+            team.save(update_fields=["purse_amount", "remaining_purse"])
 
 
 class CategorySerializer(serializers.ModelSerializer):
@@ -194,6 +245,9 @@ class TeamCategoryLimitSerializer(serializers.ModelSerializer):
         read_only_fields = ["id", "team", "category_name", "category_base_value", "bought_count", "remaining_slots", "required_points"]
 
     def get_bought_count(self, obj):
+        prefetched_players = getattr(obj.team, "_prefetched_objects_cache", {}).get("players")
+        if prefetched_players is not None:
+            return sum(1 for player in prefetched_players if player.category_id == obj.category_id)
         return obj.team.players.filter(category=obj.category).count()
 
     def get_remaining_slots(self, obj):
@@ -206,6 +260,8 @@ class TeamCategoryLimitSerializer(serializers.ModelSerializer):
 class TeamSerializer(serializers.ModelSerializer):
     owner_password = serializers.CharField(write_only=True, required=False, allow_blank=True)
     owner_user_id = serializers.IntegerField(source="owner_user.id", read_only=True)
+    purse_amount = serializers.DecimalField(source="auction.purse_amount", max_digits=14, decimal_places=2, read_only=True)
+    purse_type = serializers.CharField(source="auction.unit", read_only=True)
     category_limits = TeamCategoryLimitSerializer(many=True, read_only=True)
     required_points = serializers.SerializerMethodField()
     budget_left_after_required = serializers.SerializerMethodField()
@@ -224,6 +280,7 @@ class TeamSerializer(serializers.ModelSerializer):
             "owner_password",
             "owner_user_id",
             "purse_amount",
+            "purse_type",
             "remaining_purse",
             "players_bought",
             "maximum_players",
@@ -232,12 +289,31 @@ class TeamSerializer(serializers.ModelSerializer):
             "budget_left_after_required",
             "status",
         ]
-        read_only_fields = ["id", "team_id", "owner_user_id", "category_limits", "required_points", "budget_left_after_required"]
+        read_only_fields = [
+            "id",
+            "team_id",
+            "owner_user_id",
+            "purse_amount",
+            "purse_type",
+            "remaining_purse",
+            "players_bought",
+            "category_limits",
+            "required_points",
+            "budget_left_after_required",
+        ]
 
     def _required_points(self, team: Team) -> Decimal:
         total = Decimal("0")
-        for limit in team.category_limits.select_related("category"):
-            bought_count = team.players.filter(category=limit.category).count()
+        cache = getattr(team, "_prefetched_objects_cache", {})
+        limits = cache.get("category_limits")
+        if limits is None:
+            limits = team.category_limits.select_related("category")
+        prefetched_players = cache.get("players")
+        for limit in limits:
+            if prefetched_players is None:
+                bought_count = team.players.filter(category=limit.category).count()
+            else:
+                bought_count = sum(1 for player in prefetched_players if player.category_id == limit.category_id)
             total += limit.category.base_value * max(limit.maximum_players - bought_count, 0)
         return total
 
@@ -250,6 +326,10 @@ class TeamSerializer(serializers.ModelSerializer):
     @transaction.atomic
     def create(self, validated_data):
         password = validated_data.pop("owner_password", "").strip()
+        auction = validated_data.get("auction")
+        if auction:
+            validated_data["purse_amount"] = auction.purse_amount
+            validated_data["remaining_purse"] = auction.purse_amount
         team = Team.objects.create(**validated_data)
         self._sync_owner(team, password)
         return team
@@ -346,6 +426,8 @@ class BidSerializer(serializers.ModelSerializer):
     team_short_name = serializers.CharField(source="team.short_name", read_only=True)
     team_logo_url = serializers.CharField(source="team.logo_url", read_only=True)
     owner_name = serializers.CharField(source="team.owner_name", read_only=True)
+    team_limit_reached = serializers.SerializerMethodField()
+    team_limit_message = serializers.SerializerMethodField()
 
     class Meta:
         model = Bid
@@ -367,8 +449,34 @@ class BidSerializer(serializers.ModelSerializer):
             "created_at",
             "approved_by_admin",
             "approved_at",
+            "team_limit_reached",
+            "team_limit_message",
         ]
-        read_only_fields = ["id", "created_at", "approved_by_admin", "approved_at"]
+        read_only_fields = ["id", "created_at", "approved_by_admin", "approved_at", "team_limit_reached", "team_limit_message"]
+
+    def get_team_limit_reached(self, obj):
+        return bool(self._team_limit_message(obj))
+
+    def get_team_limit_message(self, obj):
+        return self._team_limit_message(obj)
+
+    def _team_limit_message(self, obj):
+        player = obj.player
+        team = obj.team
+        if team.maximum_players and team.players.count() >= team.maximum_players:
+            return f"{team.short_name} already has the maximum squad of {team.maximum_players} players."
+        if not player.category_id:
+            return ""
+        limit = team.category_limits.filter(category=player.category).first()
+        if not limit or limit.maximum_players == 0:
+            return ""
+        bought_count = team.players.filter(category=player.category).count()
+        if bought_count >= limit.maximum_players:
+            return (
+                f"Category limit reached: {team.short_name} already has the maximum players "
+                f"for {player.category.name} ({bought_count}/{limit.maximum_players})."
+            )
+        return ""
 
 
 class SoldPlayerSerializer(serializers.ModelSerializer):

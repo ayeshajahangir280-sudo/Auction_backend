@@ -5,7 +5,6 @@ from .models import (
     AuctionLog,
     AuctionSettings,
     Bid,
-    Category,
     Player,
     RoleProfile,
     SoldPlayer,
@@ -26,7 +25,6 @@ class AuctionAdmin(admin.ModelAdmin):
 admin.site.register(RoleProfile)
 admin.site.register(AuctionSettings)
 admin.site.register(Sponsor)
-admin.site.register(Category)
 admin.site.register(Player)
 admin.site.register(Team)
 admin.site.register(TeamOwner)

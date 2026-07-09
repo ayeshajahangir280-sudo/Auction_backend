@@ -99,6 +99,7 @@ class Auction(models.Model):
         related_name="+",
     )
     sold_animation_state = models.BooleanField(default=False)
+    live_revision = models.PositiveBigIntegerField(default=0)
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
