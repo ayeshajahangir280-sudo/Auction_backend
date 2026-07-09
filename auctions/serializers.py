@@ -421,7 +421,7 @@ class PlayerSerializer(serializers.ModelSerializer):
 class BidSerializer(serializers.ModelSerializer):
     player_name = serializers.CharField(source="player.full_name", read_only=True)
     player_image_url = serializers.CharField(source="player.image_url", read_only=True)
-    player_category = serializers.CharField(source="player.category.name", read_only=True)
+    player_category = serializers.SerializerMethodField()
     team_name = serializers.CharField(source="team.name", read_only=True)
     team_short_name = serializers.CharField(source="team.short_name", read_only=True)
     team_logo_url = serializers.CharField(source="team.logo_url", read_only=True)
@@ -460,6 +460,9 @@ class BidSerializer(serializers.ModelSerializer):
     def get_team_limit_message(self, obj):
         return self._team_limit_message(obj)
 
+    def get_player_category(self, obj):
+        return obj.player.category.name if obj.player and obj.player.category else ""
+
     def _team_limit_message(self, obj):
         player = obj.player
         team = obj.team
@@ -483,7 +486,7 @@ class SoldPlayerSerializer(serializers.ModelSerializer):
     player_name = serializers.CharField(source="player.full_name", read_only=True)
     player_image_url = serializers.CharField(source="player.image_url", read_only=True)
     player_role = serializers.CharField(source="player.role", read_only=True)
-    player_category = serializers.CharField(source="player.category.name", read_only=True)
+    player_category = serializers.SerializerMethodField()
     team_name = serializers.CharField(source="team.name", read_only=True)
     team_short_name = serializers.CharField(source="team.short_name", read_only=True)
     team_logo_url = serializers.CharField(source="team.logo_url", read_only=True)
@@ -506,6 +509,9 @@ class SoldPlayerSerializer(serializers.ModelSerializer):
             "sold_time",
         ]
         read_only_fields = ["id", "sold_time"]
+
+    def get_player_category(self, obj):
+        return obj.player.category.name if obj.player and obj.player.category else ""
 
 
 class AuctionLogSerializer(serializers.ModelSerializer):
