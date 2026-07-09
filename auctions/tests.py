@@ -7,11 +7,7 @@ from rest_framework.test import APIClient
 
 from config.settings import LOCAL_DEV_CORS_ALLOWED_ORIGIN_REGEXES
 
-<<<<<<< HEAD
-from .models import Auction, Bid, Category, Player, RoleProfile, SoldPlayer, Team, TeamCategoryLimit, TeamOwner
-=======
-from .models import Auction, Bid, Category, Player, RoleProfile, Sponsor, Team, TeamCategoryLimit, TeamOwner
->>>>>>> d320def63d52da3a1ce9b729ae793fe8b197c5b1
+from .models import Auction, Bid, Category, Player, RoleProfile, SoldPlayer, Sponsor, Team, TeamCategoryLimit, TeamOwner
 
 
 User = get_user_model()
@@ -276,6 +272,22 @@ class AuctionWorkflowTests(TestCase):
         self.auction.refresh_from_db()
         self.assertGreater(self.auction.live_revision, starting_revision)
 
+    def test_manual_bid_accepts_comma_formatted_amount_without_server_error(self):
+        current_player = self.players[0]
+        current_player.status = Player.Status.IN_AUCTION
+        current_player.save(update_fields=["status"])
+        self.auction.current_player = current_player
+        self.auction.status = Auction.Status.LIVE
+        self.auction.save(update_fields=["current_player", "status"])
+
+        response = self.client.post(
+            f"/api/auctions/{self.auction.auction_id}/manual-bid/",
+            {"team_id": self.team.team_id, "bid_amount": "1,000.00"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(Decimal(response.data["bid_amount"]), Decimal("1000.00"))
 
     def test_complete_auction_marks_remaining_players_unsold(self):
         current_player = self.players[0]

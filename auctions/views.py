@@ -848,7 +848,13 @@ class AuctionViewSet(viewsets.ModelViewSet):
         if not team or team.auction_id != auction.pk:
             raise ValidationError({"team": "Team not found in this auction."})
         validate_team_player_limits(team, player)
-        amount = Decimal(str(request.data.get("bid_amount") or request.data.get("amount") or "0"))
+        raw_amount = request.data.get("bid_amount") or request.data.get("amount") or "0"
+        try:
+            amount = Decimal(str(raw_amount).replace(",", "").strip())
+        except (InvalidOperation, ValueError) as exc:
+            raise ValidationError({"bid_amount": "Bid amount must be a valid number."}) from exc
+        if amount <= 0:
+            raise ValidationError({"bid_amount": "Bid amount must be greater than zero."})
         if amount > team.remaining_purse:
             raise ValidationError({"bid_amount": "Team does not have enough remaining points."})
         current = highest_active_bid(auction, player)
