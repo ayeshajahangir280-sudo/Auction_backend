@@ -7,7 +7,11 @@ from rest_framework.test import APIClient
 
 from config.settings import LOCAL_DEV_CORS_ALLOWED_ORIGIN_REGEXES
 
+<<<<<<< HEAD
 from .models import Auction, Bid, Category, Player, RoleProfile, SoldPlayer, Team, TeamCategoryLimit, TeamOwner
+=======
+from .models import Auction, Bid, Category, Player, RoleProfile, Sponsor, Team, TeamCategoryLimit, TeamOwner
+>>>>>>> d320def63d52da3a1ce9b729ae793fe8b197c5b1
 
 
 User = get_user_model()
@@ -313,6 +317,45 @@ class AuctionWorkflowTests(TestCase):
 
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.headers.get("Access-Control-Allow-Origin"), origin)
+
+    def test_created_sponsor_is_returned_for_project_filter(self):
+        response = self.client.post(
+            "/api/sponsors/",
+            {
+                "auction": self.auction.pk,
+                "name": "Broadcast Partner",
+                "logo_url": "https://cdn.example.com/sponsor.png",
+                "status": "active",
+                "sort_order": 1,
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, 201)
+
+        list_response = self.client.get(f"/api/sponsors/?auction={self.auction.auction_id}")
+
+        self.assertEqual(list_response.status_code, 200)
+        self.assertEqual(len(list_response.data), 1)
+        self.assertEqual(list_response.data[0]["name"], "Broadcast Partner")
+        self.assertEqual(list_response.data[0]["logo_url"], "https://cdn.example.com/sponsor.png")
+
+    def test_public_active_includes_project_sponsors(self):
+        Sponsor.objects.create(
+            auction=self.auction,
+            name="Title Sponsor",
+            logo_url="https://cdn.example.com/title.png",
+            status="active",
+            sort_order=1,
+        )
+        public_client = APIClient()
+
+        response = public_client.get("/api/auctions/public-active/")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["auction"]["auction_id"], self.auction.auction_id)
+        self.assertEqual(response.data["auction"]["sponsors"][0]["name"], "Title Sponsor")
+        self.assertEqual(response.data["auction"]["sponsors"][0]["logo_url"], "https://cdn.example.com/title.png")
+        self.assertEqual(response.data["auction"]["sponsors"][0]["status"], "active")
 
     def test_team_creation_does_not_create_owner_credentials_unless_requested(self):
         self.auction.purse_amount = Decimal("3005")
