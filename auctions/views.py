@@ -1,5 +1,6 @@
 import csv
 import json
+import random
 import re
 import time
 import uuid
@@ -485,7 +486,12 @@ def advance_to_random_player(auction: Auction, actor=None) -> Player | None:
     next_player_qs = auction.players.filter(status=Player.Status.AVAILABLE)
     if current_player_id:
         next_player_qs = next_player_qs.exclude(pk=current_player_id)
-    next_player = next_player_qs.order_by("?").first()
+    available_count = next_player_qs.count()
+    next_player = (
+        next_player_qs.order_by("id")[random.randrange(available_count)]
+        if available_count
+        else None
+    )
     if not next_player:
         current_player = auction.current_player
         if current_player and current_player.status == Player.Status.IN_AUCTION:
