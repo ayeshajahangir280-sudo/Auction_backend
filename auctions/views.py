@@ -20,6 +20,7 @@ from rest_framework.decorators import action
 from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
+from rest_framework.utils.encoders import JSONEncoder
 from rest_framework.views import APIView
 from rest_framework_simplejwt.tokens import RefreshToken
 
@@ -40,6 +41,7 @@ from .serializers import (
 )
 
 User = get_user_model()
+LIVE_EVENT_POLL_SECONDS = 0.2
 
 MISSING_IMAGE_SVG = b"""<svg xmlns="http://www.w3.org/2000/svg" width="320" height="240" viewBox="0 0 320 240"><rect width="320" height="240" fill="#e7edf8"/><path d="M70 158l48-56 42 48 26-30 64 74H70z" fill="#b8c7df"/><circle cx="226" cy="78" r="22" fill="#c9d6ea"/><text x="160" y="218" text-anchor="middle" font-family="Arial, sans-serif" font-size="18" font-weight="700" fill="#48618a">Image unavailable</text></svg>"""
 
@@ -279,7 +281,7 @@ def sse_event(event: str, data: dict, event_id: str | int | None = None) -> str:
     if event_id is not None:
         lines.append(f"id: {event_id}")
     lines.append(f"event: {event}")
-    lines.append(f"data: {json.dumps(data, separators=(',', ':'))}")
+    lines.append(f"data: {json.dumps(data, separators=(',', ':'), cls=JSONEncoder)}")
     return "\n".join(lines) + "\n\n"
 
 
@@ -530,24 +532,34 @@ def public_active_auction():
 
 
 def auction_revision_stream(auction_pk: int):
-    last_revision = Auction.objects.filter(pk=auction_pk).values_list("live_revision", flat=True).first()
+    auction = Auction.objects.filter(pk=auction_pk).first()
+    last_revision = auction.live_revision if auction else None
     yield "retry: 1500\n\n"
-    if last_revision is not None:
-        yield sse_event("revision", {"revision": last_revision}, last_revision)
+    if auction is not None:
+        yield sse_event(
+            "revision",
+            {"revision": last_revision, "state": serialize_live_state(auction)},
+            last_revision,
+        )
     last_heartbeat = time.monotonic()
     while True:
-        revision = Auction.objects.filter(pk=auction_pk).values_list("live_revision", flat=True).first()
-        if revision is None:
+        auction = Auction.objects.filter(pk=auction_pk).first()
+        if auction is None:
             yield sse_event("deleted", {"auction": None})
             return
+        revision = auction.live_revision
         if revision != last_revision:
             last_revision = revision
-            yield sse_event("revision", {"revision": revision}, revision)
+            yield sse_event(
+                "revision",
+                {"revision": revision, "state": serialize_live_state(auction)},
+                revision,
+            )
             last_heartbeat = time.monotonic()
         elif time.monotonic() - last_heartbeat >= 15:
             yield ": keepalive\n\n"
             last_heartbeat = time.monotonic()
-        time.sleep(0.75)
+        time.sleep(LIVE_EVENT_POLL_SECONDS)
 
 
 def public_active_revision_stream():
@@ -555,20 +567,36 @@ def public_active_revision_stream():
     last_token = f"{auction.auction_id}:{auction.live_revision}" if auction else ""
     yield "retry: 1500\n\n"
     if auction:
-        yield sse_event("revision", {"auction_id": auction.auction_id, "revision": auction.live_revision}, last_token)
+        yield sse_event(
+            "revision",
+            {
+                "auction_id": auction.auction_id,
+                "revision": auction.live_revision,
+                "state": serialize_live_state(auction),
+            },
+            last_token,
+        )
     last_heartbeat = time.monotonic()
     while True:
         auction = public_active_auction()
         token = f"{auction.auction_id}:{auction.live_revision}" if auction else ""
         if token != last_token:
             last_token = token
-            payload = {"auction_id": auction.auction_id, "revision": auction.live_revision} if auction else {"auction_id": None}
+            payload = (
+                {
+                    "auction_id": auction.auction_id,
+                    "revision": auction.live_revision,
+                    "state": serialize_live_state(auction),
+                }
+                if auction
+                else {"auction_id": None}
+            )
             yield sse_event("revision", payload, token or "none")
             last_heartbeat = time.monotonic()
         elif time.monotonic() - last_heartbeat >= 15:
             yield ": keepalive\n\n"
             last_heartbeat = time.monotonic()
-        time.sleep(0.75)
+        time.sleep(LIVE_EVENT_POLL_SECONDS)
 
 
 class LoginView(APIView):
