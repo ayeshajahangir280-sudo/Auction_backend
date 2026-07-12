@@ -847,6 +847,15 @@ class AuctionViewSet(viewsets.ModelViewSet):
             team = auction.teams.filter(team_id=team_value).first() or auction.teams.filter(pk=team_value).first()
         if not team or team.auction_id != auction.pk:
             raise ValidationError({"team": "Team not found in this auction."})
+        if team.status != Team.Status.ACTIVE:
+            raise ValidationError(
+                {
+                    "team": (
+                        f"{team.short_name or team.name} is "
+                        f"{team.get_status_display().lower()} and cannot place bids."
+                    )
+                }
+            )
         validate_team_player_limits(team, player)
         raw_amount = request.data.get("bid_amount") or request.data.get("amount") or "0"
         try:

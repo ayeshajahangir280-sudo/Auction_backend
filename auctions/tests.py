@@ -289,6 +289,26 @@ class AuctionWorkflowTests(TestCase):
         self.assertEqual(response.status_code, 201)
         self.assertEqual(Decimal(response.data["bid_amount"]), Decimal("1000.00"))
 
+    def test_manual_bid_rejects_inactive_team(self):
+        current_player = self.players[0]
+        current_player.status = Player.Status.IN_AUCTION
+        current_player.save(update_fields=["status"])
+        self.auction.current_player = current_player
+        self.auction.status = Auction.Status.LIVE
+        self.auction.save(update_fields=["current_player", "status"])
+        self.team.status = Team.Status.SUSPENDED
+        self.team.save(update_fields=["status"])
+
+        response = self.client.post(
+            f"/api/auctions/{self.auction.auction_id}/manual-bid/",
+            {"team_id": self.team.team_id, "bid_amount": "110"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("cannot place bids", str(response.data))
+        self.assertFalse(Bid.objects.filter(auction=self.auction, player=current_player).exists())
+
     def test_complete_auction_marks_remaining_players_unsold(self):
         current_player = self.players[0]
         current_player.status = Player.Status.IN_AUCTION
