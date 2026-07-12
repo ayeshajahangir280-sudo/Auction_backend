@@ -42,7 +42,7 @@ from .serializers import (
 )
 
 User = get_user_model()
-LIVE_EVENT_POLL_SECONDS = 0.2
+LIVE_EVENT_POLL_SECONDS = 0.1
 
 MISSING_IMAGE_SVG = b"""<svg xmlns="http://www.w3.org/2000/svg" width="320" height="240" viewBox="0 0 320 240"><rect width="320" height="240" fill="#e7edf8"/><path d="M70 158l48-56 42 48 26-30 64 74H70z" fill="#b8c7df"/><circle cx="226" cy="78" r="22" fill="#c9d6ea"/><text x="160" y="218" text-anchor="middle" font-family="Arial, sans-serif" font-size="18" font-weight="700" fill="#48618a">Image unavailable</text></svg>"""
 
