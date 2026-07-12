@@ -466,14 +466,31 @@ class BidSerializer(serializers.ModelSerializer):
     def _team_limit_message(self, obj):
         player = obj.player
         team = obj.team
-        if team.maximum_players and team.players.count() >= team.maximum_players:
+        prefetched_players = getattr(team, "_prefetched_objects_cache", {}).get("players")
+        players_bought = (
+            len(prefetched_players)
+            if prefetched_players is not None
+            else team.players.count()
+        )
+        if team.maximum_players and players_bought >= team.maximum_players:
             return f"{team.short_name} already has the maximum squad of {team.maximum_players} players."
         if not player.category_id:
             return ""
-        limit = team.category_limits.filter(category=player.category).first()
+        prefetched_limits = getattr(team, "_prefetched_objects_cache", {}).get("category_limits")
+        if prefetched_limits is not None:
+            limit = next(
+                (item for item in prefetched_limits if item.category_id == player.category_id),
+                None,
+            )
+        else:
+            limit = team.category_limits.filter(category=player.category).first()
         if not limit or limit.maximum_players == 0:
             return ""
-        bought_count = team.players.filter(category=player.category).count()
+        bought_count = (
+            sum(1 for item in prefetched_players if item.category_id == player.category_id)
+            if prefetched_players is not None
+            else team.players.filter(category=player.category).count()
+        )
         if bought_count >= limit.maximum_players:
             return (
                 f"Category limit reached: {team.short_name} already has the maximum players "

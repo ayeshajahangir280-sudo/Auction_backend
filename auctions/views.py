@@ -404,6 +404,16 @@ def live_team_queryset(auction: Auction):
     )
 
 
+def live_bid_queryset(auction: Auction):
+    return auction.bids.select_related("player", "player__category", "team").prefetch_related(
+        Prefetch(
+            "team__category_limits",
+            queryset=TeamCategoryLimit.objects.select_related("category"),
+        ),
+        Prefetch("team__players", queryset=Player.objects.only("id", "sold_team_id", "category_id")),
+    )
+
+
 def build_results(auction: Auction, teams=None) -> dict:
     sold_qs = auction.sold_players.select_related("player", "player__category", "team")
     sold_count = sold_qs.count()
@@ -437,21 +447,19 @@ def build_results(auction: Auction, teams=None) -> dict:
 
 def serialize_live_state(auction: Auction, team_scope: Team | None = None) -> dict:
     current_player = auction.current_player
+    bids_qs = live_bid_queryset(auction)
     current_player_bids = (
-        auction.bids.select_related("player", "player__category", "team")
-        .filter(player=current_player, bid_status__in=[Bid.Status.PENDING, Bid.Status.APPROVED])
+        bids_qs.filter(player=current_player, bid_status__in=[Bid.Status.PENDING, Bid.Status.APPROVED])
         .order_by("-bid_amount", "-created_at")
         if current_player
         else Bid.objects.none()
     )
     bid_feed = (
-        auction.bids.select_related("player", "player__category", "team")
-        .filter(bid_status=Bid.Status.APPROVED)
+        bids_qs.filter(bid_status=Bid.Status.APPROVED)
         .order_by("-created_at")[:20]
     )
     pending_qs = (
-        auction.bids.select_related("player", "player__category", "team")
-        .filter(bid_status=Bid.Status.PENDING)
+        bids_qs.filter(bid_status=Bid.Status.PENDING)
         .order_by("-bid_amount", "-created_at")
     )
     teams_qs = live_team_queryset(auction).order_by("name")
