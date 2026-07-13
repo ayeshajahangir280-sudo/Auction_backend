@@ -489,6 +489,36 @@ def serialize_live_state(auction: Auction, team_scope: Team | None = None) -> di
     }
 
 
+def close_current_player_before_switch(auction: Auction, next_player: Player, actor=None) -> None:
+    current_player = auction.current_player
+    if (
+        not current_player
+        or current_player.pk == next_player.pk
+        or current_player.status != Player.Status.IN_AUCTION
+    ):
+        return
+
+    has_active_bid = auction.bids.filter(
+        player=current_player,
+        bid_status__in=[Bid.Status.PENDING, Bid.Status.APPROVED],
+    ).exists()
+    if has_active_bid:
+        current_player.status = Player.Status.AVAILABLE
+        current_player.save(update_fields=["status"])
+        return
+
+    current_player.status = Player.Status.UNSOLD
+    current_player.sold_team = None
+    current_player.sold_price = None
+    current_player.save(update_fields=["status", "sold_team", "sold_price"])
+    AuctionLog.objects.create(
+        auction=auction,
+        actor=actor,
+        action="player.auto_unsold",
+        message=f"{current_player.full_name} marked unsold when the next player was selected.",
+    )
+
+
 def advance_to_random_player(auction: Auction, actor=None) -> Player | None:
     current_player_id = auction.current_player_id
     next_player_qs = auction.players.filter(status=Player.Status.AVAILABLE)
@@ -510,7 +540,14 @@ def advance_to_random_player(auction: Auction, actor=None) -> Player | None:
         auction.save(update_fields=["current_player", "sold_animation_state"])
         return None
 
-    auction.players.filter(status=Player.Status.IN_AUCTION).exclude(pk=next_player.pk).update(status=Player.Status.AVAILABLE)
+    previous_current_id = auction.current_player_id
+    close_current_player_before_switch(auction, next_player, actor=actor)
+    stale_in_auction_qs = auction.players.filter(status=Player.Status.IN_AUCTION).exclude(
+        pk=next_player.pk
+    )
+    if previous_current_id:
+        stale_in_auction_qs = stale_in_auction_qs.exclude(pk=previous_current_id)
+    stale_in_auction_qs.update(status=Player.Status.AVAILABLE)
     next_player.status = Player.Status.IN_AUCTION
     next_player.save(update_fields=["status"])
     auction.current_player = next_player
@@ -853,7 +890,14 @@ class AuctionViewSet(viewsets.ModelViewSet):
             raise ValidationError({"player_id": "Player not found in this auction."})
         if player.status in {Player.Status.SOLD, Player.Status.UNSOLD}:
             raise ValidationError({"player_id": "Choose a player who is not sold or unsold."})
-        auction.players.filter(status=Player.Status.IN_AUCTION).update(status=Player.Status.AVAILABLE)
+        previous_current_id = auction.current_player_id
+        close_current_player_before_switch(auction, player, actor=request.user)
+        stale_in_auction_qs = auction.players.filter(status=Player.Status.IN_AUCTION).exclude(
+            pk=player.pk
+        )
+        if previous_current_id:
+            stale_in_auction_qs = stale_in_auction_qs.exclude(pk=previous_current_id)
+        stale_in_auction_qs.update(status=Player.Status.AVAILABLE)
         player.status = Player.Status.IN_AUCTION
         player.save(update_fields=["status"])
         auction.current_player = player
@@ -947,7 +991,7 @@ class AuctionViewSet(viewsets.ModelViewSet):
             raise ValidationError({"bid_amount": "Winning team does not have enough remaining purse."})
         bid.approve(request.user)
         AuctionLog.objects.create(auction=auction, actor=request.user, action="bid.approved", message=f"Approved {bid.team.short_name} bid.")
-        if auction.current_player_id == bid.player_id:
+        if bid.player.status not in {Player.Status.SOLD, Player.Status.UNSOLD}:
             sell_current_player_to_team(
                 auction,
                 bid.player,
