@@ -1,12 +1,15 @@
 import io
+import hashlib
+import json
 import re
 from decimal import Decimal
 from urllib.parse import unquote, urlparse
 from urllib.request import Request, urlopen
 
 from django.conf import settings
+from django.core.cache import cache
 from django.core.files.storage import default_storage
-from PIL import Image as PillowImage
+from PIL import Image as PillowImage, ImageOps
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.utils import ImageReader
@@ -22,14 +25,23 @@ MUTED = colors.HexColor("#64748b")
 BORDER = colors.HexColor("#d7dde8")
 SOFT_BG = colors.HexColor("#f4f7fb")
 TEXT = colors.HexColor("#0f172a")
+PDF_CACHE_SECONDS = 15 * 60
+REMOTE_IMAGE_TIMEOUT_SECONDS = 1.2
+REMOTE_IMAGE_MAX_BYTES = 1024 * 1024
 
 
 def build_team_roster_pdf(auction: Auction, team: Team, request=None) -> bytes:
+    rows = _team_roster_rows(auction, team)
+    cache_key = _team_roster_cache_key(auction, team, rows)
+    cached_pdf = cache.get(cache_key)
+    if cached_pdf:
+        return cached_pdf
+
     buffer = io.BytesIO()
     pdf = canvas.Canvas(buffer, pagesize=A4, pageCompression=0)
-    rows = _team_roster_rows(auction, team)
+    image_cache: dict[str, bytes | ImageReader | None] = {}
 
-    _draw_header(pdf, auction, team, rows, request)
+    _draw_header(pdf, auction, team, rows, request, image_cache)
     y = PAGE_HEIGHT - 198
     _draw_table_header(pdf, y)
     y -= 38
@@ -45,12 +57,14 @@ def build_team_roster_pdf(auction: Auction, team: Team, request=None) -> bytes:
                 y = PAGE_HEIGHT - 104
                 _draw_table_header(pdf, y)
                 y -= 38
-            _draw_player_row(pdf, y, index, row, auction.unit, request)
+            _draw_player_row(pdf, y, index, row, auction.unit, request, image_cache)
             y -= 72
 
     _draw_footer(pdf)
     pdf.save()
-    return buffer.getvalue()
+    pdf_data = buffer.getvalue()
+    cache.set(cache_key, pdf_data, PDF_CACHE_SECONDS)
+    return pdf_data
 
 
 def team_roster_pdf_filename(auction: Auction, team: Team) -> str:
@@ -78,14 +92,47 @@ def _team_roster_rows(auction: Auction, team: Team) -> list[dict]:
     return [{"player": player, "sold_price": player.sold_price or Decimal("0")} for player in players]
 
 
-def _draw_header(pdf: canvas.Canvas, auction: Auction, team: Team, rows: list[dict], request) -> None:
+def _team_roster_cache_key(auction: Auction, team: Team, rows: list[dict]) -> str:
+    payload = {
+        "auction": {
+            "id": auction.pk,
+            "name": auction.name,
+            "unit": auction.unit,
+            "logo_url": auction.logo_url,
+            "live_revision": auction.live_revision,
+        },
+        "team": {
+            "id": team.pk,
+            "name": team.name,
+            "short_name": team.short_name,
+            "logo_url": team.logo_url,
+            "remaining_purse": str(team.remaining_purse),
+            "players_bought": team.players_bought,
+        },
+        "players": [
+            {
+                "id": row["player"].pk,
+                "name": row["player"].full_name,
+                "player_id": row["player"].player_id,
+                "category": row["player"].category.name if row["player"].category else "",
+                "image_url": row["player"].image_url,
+                "sold_price": str(row["sold_price"]),
+            }
+            for row in rows
+        ],
+    }
+    digest = hashlib.sha256(json.dumps(payload, sort_keys=True).encode("utf-8")).hexdigest()
+    return f"team-roster-pdf:{auction.pk}:{team.pk}:{digest}"
+
+
+def _draw_header(pdf: canvas.Canvas, auction: Auction, team: Team, rows: list[dict], request, image_cache) -> None:
     player_count = len(rows)
     total_spend = sum((row["sold_price"] for row in rows), Decimal("0"))
 
     pdf.setFillColor(SOFT_BG)
     pdf.rect(0, PAGE_HEIGHT - 150, PAGE_WIDTH, 150, stroke=0, fill=1)
 
-    _draw_image_or_placeholder(pdf, team.logo_url, MARGIN, PAGE_HEIGHT - 122, 82, 82, team.short_name, request)
+    _draw_image_or_placeholder(pdf, team.logo_url, MARGIN, PAGE_HEIGHT - 122, 82, 82, team.short_name, request, image_cache)
 
     pdf.setFillColor(PRIMARY)
     pdf.setFont("Helvetica-Bold", 22)
@@ -141,7 +188,7 @@ def _draw_table_header(pdf: canvas.Canvas, y: float) -> None:
     pdf.drawRightString(PAGE_WIDTH - MARGIN - 12, y - 10, "FINAL BID")
 
 
-def _draw_player_row(pdf: canvas.Canvas, y: float, index: int, row: dict, unit: str, request) -> None:
+def _draw_player_row(pdf: canvas.Canvas, y: float, index: int, row: dict, unit: str, request, image_cache) -> None:
     player: Player = row["player"]
     sold_price = row["sold_price"]
 
@@ -153,7 +200,7 @@ def _draw_player_row(pdf: canvas.Canvas, y: float, index: int, row: dict, unit: 
     pdf.setFont("Helvetica-Bold", 9)
     pdf.drawCentredString(MARGIN + 18, y - 18, str(index))
 
-    _draw_image_or_placeholder(pdf, player.image_url, MARGIN + 42, y - 44, 44, 44, _initials(player.full_name), request)
+    _draw_image_or_placeholder(pdf, player.image_url, MARGIN + 42, y - 44, 44, 44, _initials(player.full_name), request, image_cache)
 
     pdf.setFillColor(TEXT)
     pdf.setFont("Helvetica-Bold", 11)
@@ -189,8 +236,8 @@ def _draw_footer(pdf: canvas.Canvas) -> None:
     pdf.drawRightString(PAGE_WIDTH - MARGIN, 24, f"Page {pdf.getPageNumber()}")
 
 
-def _draw_image_or_placeholder(pdf: canvas.Canvas, value: str, x: float, y: float, width: float, height: float, fallback: str, request) -> None:
-    image = _image_reader(value, request)
+def _draw_image_or_placeholder(pdf: canvas.Canvas, value: str, x: float, y: float, width: float, height: float, fallback: str, request, image_cache) -> None:
+    image = _image_reader(value, request, image_cache, width, height)
     if image:
         pdf.drawImage(image, x, y, width=width, height=height, preserveAspectRatio=True, anchor="c", mask="auto")
         return
@@ -204,47 +251,73 @@ def _draw_image_or_placeholder(pdf: canvas.Canvas, value: str, x: float, y: floa
     pdf.drawCentredString(x + width / 2, y + height / 2 - 4, _fit_text(fallback or "N/A", width - 8))
 
 
-def _image_reader(value: str, request) -> ImageReader | None:
-    data = _image_bytes(value, request)
+def _image_reader(value: str, request, image_cache: dict, width: float, height: float) -> ImageReader | None:
+    cache_key = f"reader:{value}:{width:.0f}x{height:.0f}"
+    if cache_key in image_cache:
+        return image_cache[cache_key]
+
+    data = _image_bytes(value, request, image_cache)
     if not data:
+        image_cache[cache_key] = None
         return None
     try:
-        image = PillowImage.open(io.BytesIO(data))
-        if image.mode not in {"RGB", "RGBA"}:
-            image = image.convert("RGBA")
+        image = ImageOps.exif_transpose(PillowImage.open(io.BytesIO(data)))
+        image.thumbnail((max(int(width * 4), 80), max(int(height * 4), 80)), PillowImage.Resampling.LANCZOS)
         converted = io.BytesIO()
-        image.save(converted, format="PNG")
+        if image.mode in {"RGBA", "LA"} or (image.mode == "P" and "transparency" in image.info):
+            image = image.convert("RGBA")
+            image.save(converted, format="PNG", optimize=True)
+        else:
+            image = image.convert("RGB")
+            image.save(converted, format="JPEG", quality=82, optimize=True, progressive=True)
         converted.seek(0)
-        return ImageReader(converted)
+        reader = ImageReader(converted)
+        image_cache[cache_key] = reader
+        return reader
     except Exception:
+        image_cache[cache_key] = None
         return None
 
 
-def _image_bytes(value: str, request) -> bytes | None:
+def _image_bytes(value: str, request, image_cache: dict) -> bytes | None:
     if not value:
         return None
 
+    bytes_cache_key = f"bytes:{value}"
+    if bytes_cache_key in image_cache:
+        cached = image_cache[bytes_cache_key]
+        return cached if isinstance(cached, bytes) else None
+
     media_path = _media_path_from_value(value, request)
     if media_path:
-        uploaded = UploadedImage.objects.filter(path=media_path).first()
+        uploaded = UploadedImage.objects.only("data").filter(path=media_path).first()
         if uploaded:
-            return bytes(uploaded.data)
+            data = bytes(uploaded.data)
+            image_cache[bytes_cache_key] = data
+            return data
         if default_storage.exists(media_path):
             with default_storage.open(media_path, "rb") as stored_file:
-                return stored_file.read()
+                data = stored_file.read()
+                image_cache[bytes_cache_key] = data
+                return data
 
     parsed = urlparse(value)
     if parsed.scheme not in {"http", "https"}:
+        image_cache[bytes_cache_key] = None
         return None
 
     try:
         request_obj = Request(value, headers={"User-Agent": "auction-roster-pdf/1.0"})
-        with urlopen(request_obj, timeout=3) as response:
+        with urlopen(request_obj, timeout=REMOTE_IMAGE_TIMEOUT_SECONDS) as response:
             content_type = response.headers.get("Content-Type", "")
             if not content_type.startswith("image/"):
+                image_cache[bytes_cache_key] = None
                 return None
-            return response.read(3 * 1024 * 1024)
+            data = response.read(REMOTE_IMAGE_MAX_BYTES)
+            image_cache[bytes_cache_key] = data
+            return data
     except Exception:
+        image_cache[bytes_cache_key] = None
         return None
 
 

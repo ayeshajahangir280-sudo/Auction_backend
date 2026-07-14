@@ -4,6 +4,7 @@ import random
 import re
 import time
 import uuid
+from collections import defaultdict
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
@@ -42,7 +43,7 @@ from .serializers import (
 )
 
 User = get_user_model()
-LIVE_EVENT_POLL_SECONDS = 0.05
+LIVE_EVENT_POLL_SECONDS = 0.1
 
 MISSING_IMAGE_SVG = b"""<svg xmlns="http://www.w3.org/2000/svg" width="320" height="240" viewBox="0 0 320 240"><rect width="320" height="240" fill="#e7edf8"/><path d="M70 158l48-56 42 48 26-30 64 74H70z" fill="#b8c7df"/><circle cx="226" cy="78" r="22" fill="#c9d6ea"/><text x="160" y="218" text-anchor="middle" font-family="Arial, sans-serif" font-size="18" font-weight="700" fill="#48618a">Image unavailable</text></svg>"""
 
@@ -326,10 +327,20 @@ def remaining_required_points(team: Team) -> Decimal:
 def team_category_limit_message(team: Team, player: Player) -> str:
     if not player.category_id:
         return ""
-    limit = team.category_limits.filter(category=player.category).first()
+    cache = getattr(team, "_prefetched_objects_cache", {})
+    prefetched_limits = cache.get("category_limits")
+    if prefetched_limits is not None:
+        limit = next((item for item in prefetched_limits if item.category_id == player.category_id), None)
+    else:
+        limit = team.category_limits.filter(category=player.category).first()
     if not limit or limit.maximum_players == 0:
         return ""
-    bought_count = team.players.filter(category=player.category).count()
+    prefetched_players = cache.get("players")
+    bought_count = (
+        sum(1 for item in prefetched_players if item.category_id == player.category_id)
+        if prefetched_players is not None
+        else team.players.filter(category=player.category).count()
+    )
     if bought_count >= limit.maximum_players:
         return (
             f"Category limit reached: {team.short_name} already has the maximum players "
@@ -339,7 +350,9 @@ def team_category_limit_message(team: Team, player: Player) -> str:
 
 
 def team_player_limit_message(team: Team, player: Player) -> tuple[str, str]:
-    if team.maximum_players and team.players.count() >= team.maximum_players:
+    prefetched_players = getattr(team, "_prefetched_objects_cache", {}).get("players")
+    players_bought = len(prefetched_players) if prefetched_players is not None else team.players.count()
+    if team.maximum_players and players_bought >= team.maximum_players:
         return "team", f"{team.short_name} already has the maximum squad of {team.maximum_players} players."
     category_message = team_category_limit_message(team, player)
     if category_message:
@@ -398,7 +411,7 @@ def sell_current_player_to_team(
 
 
 def live_team_queryset(auction: Auction):
-    return auction.teams.prefetch_related(
+    return auction.teams.select_related("auction", "owner_user").prefetch_related(
         Prefetch("category_limits", queryset=TeamCategoryLimit.objects.select_related("category")),
         Prefetch("players", queryset=Player.objects.only("id", "sold_team_id", "category_id")),
     )
@@ -414,11 +427,230 @@ def live_bid_queryset(auction: Auction):
     )
 
 
+def live_auction_queryset():
+    return Auction.objects.select_related(
+        "current_player",
+        "current_player__category",
+        "settings",
+    ).prefetch_related("sponsors")
+
+
+def live_auction_for_pk(auction_pk: int):
+    return live_auction_queryset().filter(pk=auction_pk).first()
+
+
+def decimal_text(value) -> str:
+    return str(value if value is not None else Decimal("0"))
+
+
+def iso_datetime(value):
+    if value is None:
+        return None
+    return value.isoformat().replace("+00:00", "Z")
+
+
+def live_settings_data(auction: Auction) -> dict:
+    try:
+        auction_settings = auction.settings
+    except AuctionSettings.DoesNotExist:
+        return {
+            "show_remaining_purse": True,
+            "require_bid_approval": True,
+            "enable_owner_bidding": False,
+            "auto_advance_after_sale": False,
+            "sponsor_rotation_seconds": 8,
+            "public_screen_theme": "purple_glow",
+            "notes": "",
+        }
+    return {
+        "show_remaining_purse": auction_settings.show_remaining_purse,
+        "require_bid_approval": auction_settings.require_bid_approval,
+        "enable_owner_bidding": auction_settings.enable_owner_bidding,
+        "auto_advance_after_sale": auction_settings.auto_advance_after_sale,
+        "sponsor_rotation_seconds": auction_settings.sponsor_rotation_seconds,
+        "public_screen_theme": auction_settings.public_screen_theme,
+        "notes": auction_settings.notes,
+    }
+
+
+def live_sponsor_data(sponsor: Sponsor) -> dict:
+    return {
+        "id": sponsor.pk,
+        "auction": sponsor.auction_id,
+        "name": sponsor.name,
+        "logo_url": sponsor.logo_url,
+        "status": sponsor.status,
+        "sort_order": sponsor.sort_order,
+    }
+
+
+def live_auction_data(auction: Auction, results: dict, team_count: int) -> dict:
+    return {
+        "id": auction.pk,
+        "auction_id": auction.auction_id,
+        "name": auction.name,
+        "manager": auction.manager_id,
+        "manager_name": "",
+        "auction_type": auction.auction_type,
+        "number_of_teams": auction.number_of_teams,
+        "allotted_to_user": auction.allotted_to_user,
+        "payment_status": auction.payment_status,
+        "status": auction.status,
+        "logo_url": auction.logo_url,
+        "unit": auction.unit,
+        "purse_amount": decimal_text(auction.purse_amount),
+        "purse": decimal_text(auction.purse_amount),
+        "purse_type": auction.unit,
+        "bid_increment": decimal_text(auction.bid_increment),
+        "timer_duration": auction.timer_duration,
+        "minimum_players_per_team": auction.minimum_players_per_team,
+        "maximum_players_per_team": auction.maximum_players_per_team,
+        "current_player": auction.current_player_id,
+        "sold_animation_state": auction.sold_animation_state,
+        "live_revision": auction.live_revision,
+        "team_count": team_count,
+        "player_count": results["sold_count"] + results["unsold_count"] + results["available_count"],
+        "setup_enabled": True,
+        "sponsors": [live_sponsor_data(sponsor) for sponsor in auction.sponsors.all()],
+        "settings": live_settings_data(auction),
+        "created_at": iso_datetime(auction.created_at),
+        "updated_at": iso_datetime(auction.updated_at),
+    }
+
+
+def live_player_data(player: Player | None) -> dict | None:
+    if not player:
+        return None
+    return {
+        "id": player.pk,
+        "auction": player.auction_id,
+        "player_id": player.player_id,
+        "first_name": player.first_name,
+        "last_name": player.last_name,
+        "full_name": player.full_name,
+        "category": player.category_id,
+        "category_name": player.category.name if player.category else "",
+        "image_url": player.image_url,
+        "role": player.role,
+        "country": player.country,
+        "age": player.age,
+        "base_price": decimal_text(player.base_price),
+        "extra_field_1": player.extra_field_1,
+        "extra_field_2": player.extra_field_2,
+        "extra_field_3": player.extra_field_3,
+        "extra_field_4": player.extra_field_4,
+        "status": player.status,
+        "sold_team": player.sold_team_id,
+        "sold_team_name": getattr(player.sold_team, "name", "") if player.sold_team_id else "",
+        "sold_price": decimal_text(player.sold_price) if player.sold_price is not None else None,
+        "queue_order": player.queue_order,
+    }
+
+
+def live_team_limit_data(limit: TeamCategoryLimit) -> dict:
+    team = limit.team
+    prefetched_players = getattr(team, "_prefetched_objects_cache", {}).get("players")
+    bought_count = (
+        sum(1 for player in prefetched_players if player.category_id == limit.category_id)
+        if prefetched_players is not None
+        else team.players.filter(category=limit.category).count()
+    )
+    remaining_slots = max(limit.maximum_players - bought_count, 0)
+    required_points = limit.category.base_value * remaining_slots
+    return {
+        "id": limit.pk,
+        "team": team.pk,
+        "category": limit.category_id,
+        "category_name": limit.category.name,
+        "category_base_value": decimal_text(limit.category.base_value),
+        "maximum_players": limit.maximum_players,
+        "bought_count": bought_count,
+        "remaining_slots": remaining_slots,
+        "required_points": decimal_text(required_points),
+    }
+
+
+def live_team_data(team: Team) -> dict:
+    required = remaining_required_points(team)
+    return {
+        "id": team.pk,
+        "auction": team.auction_id,
+        "team_id": team.team_id,
+        "name": team.name,
+        "short_name": team.short_name,
+        "logo_url": team.logo_url,
+        "owner_name": team.owner_name,
+        "owner_username": team.owner_username,
+        "owner_user_id": team.owner_user_id,
+        "purse_amount": decimal_text(team.auction.purse_amount),
+        "purse_type": team.auction.unit,
+        "remaining_purse": decimal_text(team.remaining_purse),
+        "players_bought": team.players_bought,
+        "maximum_players": team.maximum_players,
+        "category_limits": [live_team_limit_data(limit) for limit in team.category_limits.all()],
+        "required_points": decimal_text(required),
+        "budget_left_after_required": decimal_text(team.remaining_purse - required),
+        "status": team.status,
+    }
+
+
+def live_bid_data(bid: Bid | None) -> dict | None:
+    if not bid:
+        return None
+    _field, limit_message = team_player_limit_message(bid.team, bid.player)
+    return {
+        "id": bid.pk,
+        "auction": bid.auction_id,
+        "player": bid.player_id,
+        "player_name": bid.player.full_name,
+        "player_image_url": bid.player.image_url,
+        "player_category": bid.player.category.name if bid.player.category else "",
+        "team": bid.team_id,
+        "team_name": bid.team.name,
+        "team_short_name": bid.team.short_name,
+        "team_logo_url": bid.team.logo_url,
+        "owner_name": bid.team.owner_name,
+        "bid_amount": decimal_text(bid.bid_amount),
+        "bid_type": bid.bid_type,
+        "bid_status": bid.bid_status,
+        "created_at": iso_datetime(bid.created_at),
+        "approved_by_admin": bid.approved_by_admin_id,
+        "approved_at": iso_datetime(bid.approved_at),
+        "team_limit_reached": bool(limit_message),
+        "team_limit_message": limit_message,
+    }
+
+
+def live_sold_player_data(sold: SoldPlayer | None) -> dict | None:
+    if not sold:
+        return None
+    return {
+        "id": sold.pk,
+        "auction": sold.auction_id,
+        "player": sold.player_id,
+        "player_name": sold.player.full_name,
+        "player_image_url": sold.player.image_url,
+        "player_role": sold.player.role,
+        "player_category": sold.player.category.name if sold.player.category else "",
+        "team": sold.team_id,
+        "team_name": sold.team.name,
+        "team_short_name": sold.team.short_name,
+        "team_logo_url": sold.team.logo_url,
+        "sold_price": decimal_text(sold.sold_price),
+        "sold_time": iso_datetime(sold.sold_time),
+    }
+
+
 def build_results(auction: Auction, teams=None) -> dict:
     sold_qs = auction.sold_players.select_related("player", "player__category", "team")
-    sold_count = sold_qs.count()
-    total_spend = sold_qs.aggregate(total=Sum("sold_price"))["total"] or Decimal("0")
+    sold_summary = sold_qs.aggregate(count=Count("id"), total=Sum("sold_price"))
+    sold_count = sold_summary["count"] or 0
+    total_spend = sold_summary["total"] or Decimal("0")
     top_sale = sold_qs.order_by("-sold_price").first()
+    player_status_counts = {
+        item["status"]: item["count"]
+        for item in auction.players.values("status").annotate(count=Count("id"))
+    }
     result_teams = []
     team_iterable = teams if teams is not None else auction.teams.annotate(roster_count=Count("players")).order_by("name")
     for team in team_iterable:
@@ -437,10 +669,10 @@ def build_results(auction: Auction, teams=None) -> dict:
         )
     return {
         "sold_count": sold_count,
-        "unsold_count": auction.players.filter(status=Player.Status.UNSOLD).count(),
-        "available_count": auction.players.filter(status=Player.Status.AVAILABLE).count(),
-        "total_spend": total_spend,
-        "top_sale": SoldPlayerSerializer(top_sale).data if top_sale else None,
+        "unsold_count": player_status_counts.get(Player.Status.UNSOLD, 0),
+        "available_count": player_status_counts.get(Player.Status.AVAILABLE, 0),
+        "total_spend": decimal_text(total_spend),
+        "top_sale": live_sold_player_data(top_sale) if top_sale else None,
         "teams": result_teams,
     }
 
@@ -474,17 +706,20 @@ def serialize_live_state(auction: Auction, team_scope: Team | None = None) -> di
         results["teams"] = [team for team in results["teams"] if team["team_id"] == team_scope.team_id]
         if results["top_sale"] and results["top_sale"]["team"] != team_scope.pk:
             results["top_sale"] = None
-    pending = pending_qs[:20]
-    current_bid = highest_active_bid(auction, current_player) if current_player else None
+    pending = list(pending_qs[:20])
+    current_player_bid_list = list(current_player_bids)
+    bid_feed_list = list(bid_feed)
+    sold_players = list(sold_players_qs[:10])
+    current_bid = current_player_bid_list[0] if current_player_bid_list else None
     return {
-        "auction": AuctionSerializer(auction).data,
-        "current_player": PlayerSerializer(current_player).data if current_player else None,
-        "teams": TeamSerializer(teams, many=True).data,
-        "current_bid": BidSerializer(current_bid).data if current_bid else None,
-        "current_player_bids": BidSerializer(current_player_bids, many=True).data,
-        "pending_bids": BidSerializer(pending, many=True).data,
-        "bid_feed": BidSerializer(bid_feed, many=True).data,
-        "sold_players": SoldPlayerSerializer(sold_players_qs[:10], many=True).data,
+        "auction": live_auction_data(auction, results, len(teams)),
+        "current_player": live_player_data(current_player),
+        "teams": [live_team_data(team) for team in teams],
+        "current_bid": live_bid_data(current_bid),
+        "current_player_bids": [live_bid_data(bid) for bid in current_player_bid_list],
+        "pending_bids": [live_bid_data(bid) for bid in pending],
+        "bid_feed": [live_bid_data(bid) for bid in bid_feed_list],
+        "sold_players": [live_sold_player_data(sold) for sold in sold_players],
         "results": results,
     }
 
@@ -565,8 +800,7 @@ def advance_to_random_player(auction: Auction, actor=None) -> Player | None:
 
 def public_active_auction():
     auction = (
-        Auction.objects.select_related("current_player", "current_player__category")
-        .prefetch_related("sponsors")
+        live_auction_queryset()
         .filter(status__in=[Auction.Status.LIVE, Auction.Status.ACTIVE, Auction.Status.SETUP])
         .order_by("-updated_at", "-created_at")
         .first()
@@ -574,16 +808,32 @@ def public_active_auction():
     if auction:
         return auction
     return (
-        Auction.objects.select_related("current_player", "current_player__category")
-        .prefetch_related("sponsors")
+        live_auction_queryset()
         .exclude(status=Auction.Status.ARCHIVED)
         .order_by("-updated_at", "-created_at")
         .first()
     )
 
 
+def public_active_auction_token():
+    token = (
+        Auction.objects.filter(status__in=[Auction.Status.LIVE, Auction.Status.ACTIVE, Auction.Status.SETUP])
+        .order_by("-updated_at", "-created_at")
+        .values_list("pk", "auction_id", "live_revision")
+        .first()
+    )
+    if token:
+        return token
+    return (
+        Auction.objects.exclude(status=Auction.Status.ARCHIVED)
+        .order_by("-updated_at", "-created_at")
+        .values_list("pk", "auction_id", "live_revision")
+        .first()
+    )
+
+
 def auction_revision_stream(auction_pk: int):
-    auction = Auction.objects.filter(pk=auction_pk).first()
+    auction = live_auction_for_pk(auction_pk)
     last_revision = auction.live_revision if auction else None
     yield "retry: 1500\n\n"
     if auction is not None:
@@ -594,13 +844,16 @@ def auction_revision_stream(auction_pk: int):
         )
     last_heartbeat = time.monotonic()
     while True:
-        auction = Auction.objects.filter(pk=auction_pk).first()
-        if auction is None:
+        revision = Auction.objects.filter(pk=auction_pk).values_list("live_revision", flat=True).first()
+        if revision is None:
             yield sse_event("deleted", {"auction": None})
             return
-        revision = auction.live_revision
         if revision != last_revision:
             last_revision = revision
+            auction = live_auction_for_pk(auction_pk)
+            if auction is None:
+                yield sse_event("deleted", {"auction": None})
+                return
             yield sse_event(
                 "revision",
                 {"revision": revision, "state": serialize_live_state(auction)},
@@ -614,8 +867,9 @@ def auction_revision_stream(auction_pk: int):
 
 
 def public_active_revision_stream():
-    auction = public_active_auction()
-    last_token = f"{auction.auction_id}:{auction.live_revision}" if auction else ""
+    active_token = public_active_auction_token()
+    auction = live_auction_for_pk(active_token[0]) if active_token else None
+    last_token = f"{active_token[1]}:{active_token[2]}" if active_token else ""
     yield "retry: 1500\n\n"
     if auction:
         yield sse_event(
@@ -629,10 +883,11 @@ def public_active_revision_stream():
         )
     last_heartbeat = time.monotonic()
     while True:
-        auction = public_active_auction()
-        token = f"{auction.auction_id}:{auction.live_revision}" if auction else ""
+        active_token = public_active_auction_token()
+        token = f"{active_token[1]}:{active_token[2]}" if active_token else ""
         if token != last_token:
             last_token = token
+            auction = live_auction_for_pk(active_token[0]) if active_token else None
             payload = (
                 {
                     "auction_id": auction.auction_id,
@@ -755,7 +1010,12 @@ class ScopedModelViewSet(viewsets.ModelViewSet):
 
 
 class AuctionViewSet(viewsets.ModelViewSet):
-    queryset = Auction.objects.select_related("manager", "current_player", "current_player__category").prefetch_related("sponsors", "teams", "players")
+    queryset = Auction.objects.select_related(
+        "manager",
+        "current_player",
+        "current_player__category",
+        "settings",
+    ).prefetch_related("sponsors")
     serializer_class = AuctionSerializer
     lookup_field = "auction_id"
 
@@ -766,7 +1026,10 @@ class AuctionViewSet(viewsets.ModelViewSet):
         return [IsAuthenticated()]
 
     def get_queryset(self):
-        qs = super().get_queryset()
+        qs = super().get_queryset().annotate(
+            team_total=Count("teams", distinct=True),
+            player_total=Count("players", distinct=True),
+        )
         if self.action in {"public_active", "public_live", "projector", "public_live_events", "public_active_events"}:
             return qs
         if is_super_admin(self.request.user):
@@ -806,15 +1069,28 @@ class AuctionViewSet(viewsets.ModelViewSet):
             auction = self.get_queryset().first()
         if not auction:
             return Response({"detail": "No assigned auction found."}, status=status.HTTP_404_NOT_FOUND)
+        teams = list(live_team_queryset(auction).order_by("name"))
+        player_status_counts = {
+            item["status"]: item["count"]
+            for item in auction.players.values("status").annotate(count=Count("id"))
+        }
+        current_player = auction.current_player
+        bid_qs = live_bid_queryset(auction)
+        current_bid = highest_active_bid(auction, current_player) if current_player else None
+        bid_feed = bid_qs.filter(bid_status=Bid.Status.APPROVED).order_by("-created_at")[:6]
         return Response(
             {
                 "auction": AuctionSerializer(auction).data,
+                "project_count": Auction.objects.count() if is_super_admin(request.user) else 1,
                 "category_count": auction.categories.count(),
-                "player_count": auction.players.count(),
-                "team_count": auction.teams.count(),
+                "player_count": sum(player_status_counts.values()),
+                "team_count": len(teams),
                 "pending_bid_count": auction.bids.filter(bid_status=Bid.Status.PENDING).count(),
-                "sold_count": auction.sold_players.count(),
-                "results": build_results(auction),
+                "sold_count": player_status_counts.get(Player.Status.SOLD, 0),
+                "results": build_results(auction, teams=teams),
+                "current_player": live_player_data(current_player),
+                "current_bid": live_bid_data(current_bid),
+                "bid_feed": [live_bid_data(bid) for bid in bid_feed],
             }
         )
 
@@ -1085,8 +1361,40 @@ class AuctionViewSet(viewsets.ModelViewSet):
     def team_roster(self, request, auction_id=None):
         auction = self.get_object()
         team = self._roster_team_for_request(request, auction)
-        players = auction.players.filter(sold_team=team).select_related("category", "sold_team")
+        players = auction.players.filter(sold_team=team).select_related("category", "sold_team").order_by("full_name", "id")
         return Response({"team": TeamSerializer(team).data, "players": PlayerSerializer(players, many=True).data})
+
+    @action(detail=True, methods=["get"], url_path="team-rosters")
+    def team_rosters(self, request, auction_id=None):
+        require_auction_staff(request.user)
+        auction = self.get_object()
+        teams = list(live_team_queryset(auction).order_by("name"))
+        team_by_pk = {team.pk: team for team in teams}
+        sold_records = (
+            auction.sold_players.filter(team_id__in=team_by_pk)
+            .select_related("player", "player__category", "team")
+            .order_by("team__name", "player__full_name", "player__id")
+        )
+        players_by_team: dict[int, list[dict]] = defaultdict(list)
+        for sold in sold_records:
+            player_data = live_player_data(sold.player)
+            if player_data:
+                player_data["sold_team"] = sold.team_id
+                player_data["sold_team_name"] = sold.team.name
+                player_data["sold_price"] = decimal_text(sold.sold_price)
+                players_by_team[sold.team_id].append(player_data)
+        return Response(
+            {
+                "auction": live_auction_data(auction, build_results(auction, teams=teams), len(teams)),
+                "rosters": [
+                    {
+                        "team": live_team_data(team),
+                        "players": players_by_team.get(team.pk, []),
+                    }
+                    for team in teams
+                ],
+            }
+        )
 
     @action(detail=True, methods=["get"], url_path="team-roster-pdf")
     def team_roster_pdf(self, request, auction_id=None):
@@ -1333,7 +1641,10 @@ class PlayerViewSet(ScopedModelViewSet):
 
 
 class TeamViewSet(ScopedModelViewSet):
-    queryset = Team.objects.select_related("auction", "owner_user")
+    queryset = Team.objects.select_related("auction", "owner_user").prefetch_related(
+        Prefetch("category_limits", queryset=TeamCategoryLimit.objects.select_related("category")),
+        Prefetch("players", queryset=Player.objects.only("id", "sold_team_id", "category_id")),
+    )
     serializer_class = TeamSerializer
 
     @transaction.atomic

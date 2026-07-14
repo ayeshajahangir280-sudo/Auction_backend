@@ -87,8 +87,8 @@ class AuctionSerializer(serializers.ModelSerializer):
     manager_name = serializers.CharField(source="manager.get_username", read_only=True)
     sponsors = SponsorSerializer(many=True, read_only=True)
     settings = AuctionSettingsSerializer(read_only=True)
-    team_count = serializers.IntegerField(source="teams.count", read_only=True)
-    player_count = serializers.IntegerField(source="players.count", read_only=True)
+    team_count = serializers.SerializerMethodField()
+    player_count = serializers.SerializerMethodField()
     setup_enabled = serializers.SerializerMethodField()
     purse = serializers.SerializerMethodField()
     purse_type = serializers.SerializerMethodField()
@@ -133,6 +133,12 @@ class AuctionSerializer(serializers.ModelSerializer):
 
     def get_setup_enabled(self, obj) -> bool:
         return bool(obj.pk)
+
+    def get_team_count(self, obj) -> int:
+        return getattr(obj, "team_total", None) if getattr(obj, "team_total", None) is not None else obj.teams.count()
+
+    def get_player_count(self, obj) -> int:
+        return getattr(obj, "player_total", None) if getattr(obj, "player_total", None) is not None else obj.players.count()
 
     def get_purse(self, obj):
         return str(obj.purse_amount)

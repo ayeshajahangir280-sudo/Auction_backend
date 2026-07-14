@@ -105,6 +105,9 @@ class Auction(models.Model):
 
     class Meta:
         ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["status", "-updated_at", "-created_at"], name="auction_status_updated_idx"),
+        ]
 
     def save(self, *args, **kwargs) -> None:
         if not self.auction_id:
@@ -138,6 +141,9 @@ class Sponsor(models.Model):
 
     class Meta:
         ordering = ["sort_order", "name"]
+        indexes = [
+            models.Index(fields=["auction", "status", "sort_order"], name="sponsor_auc_status_idx"),
+        ]
 
     def __str__(self) -> str:
         return self.name
@@ -159,6 +165,9 @@ class Category(models.Model):
 
     class Meta:
         ordering = ["name"]
+        indexes = [
+            models.Index(fields=["auction", "status"], name="category_auc_status_idx"),
+        ]
         constraints = [
             models.UniqueConstraint(fields=["auction", "category_id"], name="unique_category_code_per_auction"),
             models.UniqueConstraint(fields=["auction", "name"], name="unique_category_name_per_auction"),
@@ -201,6 +210,10 @@ class Team(models.Model):
 
     class Meta:
         ordering = ["name"]
+        indexes = [
+            models.Index(fields=["auction", "status"], name="team_auction_status_idx"),
+            models.Index(fields=["auction", "name"], name="team_auction_name_idx"),
+        ]
         constraints = [
             models.UniqueConstraint(fields=["auction", "team_id"], name="unique_team_code_per_auction"),
             models.UniqueConstraint(fields=["auction", "short_name"], name="unique_team_short_per_auction"),
@@ -282,6 +295,10 @@ class Player(models.Model):
 
     class Meta:
         ordering = ["queue_order", "id"]
+        indexes = [
+            models.Index(fields=["auction", "status", "queue_order", "id"], name="player_auc_status_queue_idx"),
+            models.Index(fields=["auction", "sold_team", "status"], name="player_auc_sold_status_idx"),
+        ]
         constraints = [
             models.UniqueConstraint(fields=["auction", "player_id"], name="unique_player_code_per_auction"),
         ]
@@ -324,6 +341,10 @@ class Bid(models.Model):
 
     class Meta:
         ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["auction", "player", "bid_status", "-bid_amount", "-created_at"], name="bid_auc_player_status_idx"),
+            models.Index(fields=["auction", "bid_status", "-created_at"], name="bid_auc_status_created_idx"),
+        ]
 
     def approve(self, user) -> None:
         self.bid_status = self.Status.APPROVED
@@ -350,6 +371,10 @@ class SoldPlayer(models.Model):
 
     class Meta:
         ordering = ["-sold_time"]
+        indexes = [
+            models.Index(fields=["auction", "team", "-sold_time"], name="sold_auc_team_time_idx"),
+            models.Index(fields=["auction", "-sold_price"], name="sold_auc_price_idx"),
+        ]
 
     def __str__(self) -> str:
         return f"{self.player.full_name} sold to {self.team.short_name}"
@@ -365,6 +390,9 @@ class AuctionLog(models.Model):
 
     class Meta:
         ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=["auction", "-created_at"], name="log_auc_created_idx"),
+        ]
 
     def __str__(self) -> str:
         return f"{self.action} - {self.auction.name}"
