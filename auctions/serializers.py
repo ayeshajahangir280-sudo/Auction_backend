@@ -72,6 +72,7 @@ class AuctionSettingsSerializer(serializers.ModelSerializer):
         fields = [
             "show_remaining_purse",
             "require_bid_approval",
+            "enable_owner_bidding",
             "auto_advance_after_sale",
             "sponsor_rotation_seconds",
             "public_screen_theme",
@@ -82,6 +83,7 @@ class AuctionSettingsSerializer(serializers.ModelSerializer):
 class AuctionSerializer(serializers.ModelSerializer):
     manager_username = serializers.CharField(write_only=True, required=False, allow_blank=True)
     manager_password = serializers.CharField(write_only=True, required=False, allow_blank=True)
+    owner_bidding_enabled = serializers.BooleanField(write_only=True, required=False)
     manager_name = serializers.CharField(source="manager.get_username", read_only=True)
     sponsors = SponsorSerializer(many=True, read_only=True)
     settings = AuctionSettingsSerializer(read_only=True)
@@ -101,6 +103,7 @@ class AuctionSerializer(serializers.ModelSerializer):
             "manager_name",
             "manager_username",
             "manager_password",
+            "owner_bidding_enabled",
             "auction_type",
             "number_of_teams",
             "allotted_to_user",
@@ -150,6 +153,7 @@ class AuctionSerializer(serializers.ModelSerializer):
     def create(self, validated_data):
         username = validated_data.pop("manager_username", "").strip()
         password = validated_data.pop("manager_password", "").strip()
+        owner_bidding_enabled = validated_data.pop("owner_bidding_enabled", None)
         manager = None
         if username:
             manager, _ = User.objects.get_or_create(username=username)
@@ -160,7 +164,10 @@ class AuctionSerializer(serializers.ModelSerializer):
             manager.save()
 
         auction = Auction.objects.create(manager=manager, **validated_data)
-        AuctionSettings.objects.create(auction=auction)
+        settings_defaults = {}
+        if owner_bidding_enabled is not None:
+            settings_defaults["enable_owner_bidding"] = owner_bidding_enabled
+        AuctionSettings.objects.create(auction=auction, **settings_defaults)
 
         if manager:
             RoleProfile.objects.update_or_create(
@@ -177,6 +184,7 @@ class AuctionSerializer(serializers.ModelSerializer):
     def update(self, instance, validated_data):
         username = validated_data.pop("manager_username", "").strip()
         password = validated_data.pop("manager_password", "").strip()
+        owner_bidding_enabled = validated_data.pop("owner_bidding_enabled", None)
         purse_was_updated = "purse_amount" in validated_data
 
         if username:
@@ -194,6 +202,11 @@ class AuctionSerializer(serializers.ModelSerializer):
 
         if purse_was_updated:
             self._sync_team_purses(instance)
+
+        if owner_bidding_enabled is not None:
+            auction_settings, _ = AuctionSettings.objects.get_or_create(auction=instance)
+            auction_settings.enable_owner_bidding = owner_bidding_enabled
+            auction_settings.save(update_fields=["enable_owner_bidding"])
 
         return instance
 

@@ -119,6 +119,7 @@ class AuctionSettings(models.Model):
     auction = models.OneToOneField(Auction, on_delete=models.CASCADE, related_name="settings")
     show_remaining_purse = models.BooleanField(default=True)
     require_bid_approval = models.BooleanField(default=True)
+    enable_owner_bidding = models.BooleanField(default=False)
     auto_advance_after_sale = models.BooleanField(default=False)
     sponsor_rotation_seconds = models.PositiveIntegerField(default=8)
     public_screen_theme = models.CharField(max_length=32, default="purple_glow")

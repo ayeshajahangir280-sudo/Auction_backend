@@ -25,7 +25,7 @@ from rest_framework.utils.encoders import JSONEncoder
 from rest_framework.views import APIView
 from rest_framework_simplejwt.tokens import RefreshToken
 
-from .models import Auction, AuctionLog, Bid, Category, Player, RoleProfile, SoldPlayer, Sponsor, Team, TeamCategoryLimit, TeamOwner, UploadedImage
+from .models import Auction, AuctionLog, AuctionSettings, Bid, Category, Player, RoleProfile, SoldPlayer, Sponsor, Team, TeamCategoryLimit, TeamOwner, UploadedImage
 from .permissions import is_auction_manager, is_super_admin, is_team_owner, scoped_auction_for_user
 from .pdf import build_team_roster_pdf, team_roster_pdf_filename
 from .serializers import (
@@ -42,7 +42,7 @@ from .serializers import (
 )
 
 User = get_user_model()
-LIVE_EVENT_POLL_SECONDS = 0.1
+LIVE_EVENT_POLL_SECONDS = 0.05
 
 MISSING_IMAGE_SVG = b"""<svg xmlns="http://www.w3.org/2000/svg" width="320" height="240" viewBox="0 0 320 240"><rect width="320" height="240" fill="#e7edf8"/><path d="M70 158l48-56 42 48 26-30 64 74H70z" fill="#b8c7df"/><circle cx="226" cy="78" r="22" fill="#c9d6ea"/><text x="160" y="218" text-anchor="middle" font-family="Arial, sans-serif" font-size="18" font-weight="700" fill="#48618a">Image unavailable</text></svg>"""
 
@@ -919,6 +919,9 @@ class AuctionViewSet(viewsets.ModelViewSet):
         if not is_team_owner(request.user):
             raise PermissionDenied("Only team owners can bid from the owner screen.")
         auction = self.get_object()
+        auction_settings, _ = AuctionSettings.objects.get_or_create(auction=auction)
+        if not auction_settings.enable_owner_bidding:
+            raise PermissionDenied("Owner bidding is disabled for this project.")
         return self._create_bid(request, auction, Bid.BidType.TEAM_OWNER)
 
     def _create_bid(self, request, auction: Auction, bid_type: str):
@@ -953,7 +956,7 @@ class AuctionViewSet(viewsets.ModelViewSet):
         if amount > team.remaining_purse:
             raise ValidationError({"bid_amount": "Team does not have enough remaining points."})
         current = highest_active_bid(auction, player)
-        minimum = (current.bid_amount if current else player.base_price) + (auction.bid_increment if current else Decimal("0"))
+        minimum = (current.bid_amount if current else player.base_price) + auction.bid_increment
         if amount < minimum:
             raise ValidationError({"bid_amount": f"Bid must be at least {minimum}."})
         bid = Bid.objects.create(
@@ -986,6 +989,11 @@ class AuctionViewSet(viewsets.ModelViewSet):
         require_auction_staff(request.user)
         auction = self.get_object()
         bid = auction.bids.select_related("player", "team").get(pk=bid_pk)
+        if bid.bid_status != Bid.Status.PENDING:
+            raise ValidationError({"bid": "Only pending bids can be approved."})
+        current_highest = highest_active_bid(auction, bid.player)
+        if not current_highest or current_highest.pk != bid.pk:
+            raise ValidationError({"bid": "Only the current highest bid can be approved."})
         validate_team_player_limits(bid.team, bid.player)
         if bid.bid_amount > bid.team.remaining_purse:
             raise ValidationError({"bid_amount": "Winning team does not have enough remaining purse."})

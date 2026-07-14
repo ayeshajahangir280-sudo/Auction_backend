@@ -7,7 +7,7 @@ from rest_framework.test import APIClient
 
 from config.settings import LOCAL_DEV_CORS_ALLOWED_ORIGIN_REGEXES
 
-from .models import Auction, Bid, Category, Player, RoleProfile, SoldPlayer, Sponsor, Team, TeamCategoryLimit, TeamOwner
+from .models import Auction, AuctionSettings, Bid, Category, Player, RoleProfile, SoldPlayer, Sponsor, Team, TeamCategoryLimit, TeamOwner
 
 
 User = get_user_model()
@@ -24,6 +24,8 @@ class AuctionWorkflowTests(TestCase):
             bid_increment=Decimal("10"),
         )
         self.other_auction = Auction.objects.create(name="Hidden Auction")
+        self.auction_settings = AuctionSettings.objects.create(auction=self.auction)
+        AuctionSettings.objects.create(auction=self.other_auction)
         RoleProfile.objects.create(
             user=self.manager,
             role=RoleProfile.Role.AUCTION_MANAGER,
@@ -263,7 +265,7 @@ class AuctionWorkflowTests(TestCase):
 
         bid_response = self.client.post(
             f"/api/auctions/{self.auction.auction_id}/manual-bid/",
-            {"team_id": self.team.team_id, "bid_amount": "100"},
+            {"team_id": self.team.team_id, "bid_amount": "110"},
             format="json",
         )
 
@@ -288,6 +290,58 @@ class AuctionWorkflowTests(TestCase):
 
         self.assertEqual(response.status_code, 201)
         self.assertEqual(Decimal(response.data["bid_amount"]), Decimal("1000.00"))
+
+    def test_first_bid_must_be_above_base_price(self):
+        current_player = self.players[0]
+        current_player.status = Player.Status.IN_AUCTION
+        current_player.save(update_fields=["status"])
+        self.auction.current_player = current_player
+        self.auction.status = Auction.Status.LIVE
+        self.auction.save(update_fields=["current_player", "status"])
+
+        response = self.client.post(
+            f"/api/auctions/{self.auction.auction_id}/manual-bid/",
+            {"team_id": self.team.team_id, "bid_amount": "100"},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("Bid must be at least 110", str(response.data))
+
+    def test_lower_pending_bid_cannot_be_approved_when_higher_bid_exists(self):
+        current_player = self.players[0]
+        current_player.status = Player.Status.IN_AUCTION
+        current_player.save(update_fields=["status"])
+        self.auction.current_player = current_player
+        self.auction.status = Auction.Status.LIVE
+        self.auction.save(update_fields=["current_player", "status"])
+
+        lower_bid_response = self.client.post(
+            f"/api/auctions/{self.auction.auction_id}/manual-bid/",
+            {"team_id": self.team.team_id, "bid_amount": "110"},
+            format="json",
+        )
+        higher_bid_response = self.client.post(
+            f"/api/auctions/{self.auction.auction_id}/manual-bid/",
+            {"team_id": self.team.team_id, "bid_amount": "120"},
+            format="json",
+        )
+
+        self.assertEqual(lower_bid_response.status_code, 201)
+        self.assertEqual(higher_bid_response.status_code, 201)
+
+        approve_lower_response = self.client.post(
+            f"/api/auctions/{self.auction.auction_id}/bids/{lower_bid_response.data['id']}/approve/",
+            {},
+            format="json",
+        )
+
+        self.assertEqual(approve_lower_response.status_code, 400)
+        self.assertIn("Only the current highest bid can be approved", str(approve_lower_response.data))
+        self.assertEqual(
+            Bid.objects.get(pk=lower_bid_response.data["id"]).bid_status,
+            Bid.Status.PENDING,
+        )
 
     def test_manual_bid_rejects_inactive_team(self):
         current_player = self.players[0]
@@ -538,6 +592,17 @@ class AuctionWorkflowTests(TestCase):
         self.assertEqual([team["id"] for team in owner_state.data["teams"]], [self.team.pk])
         self.assertNotIn(other_bid.pk, [bid["id"] for bid in owner_state.data["pending_bids"]])
         self.assertEqual([team["team_id"] for team in owner_state.data["results"]["teams"]], [self.team.team_id])
+
+        disabled_bid_response = self.client.post(
+            f"/api/auctions/{self.auction.auction_id}/team-owner-bid/",
+            {"bid_amount": "110"},
+            format="json",
+        )
+        self.assertEqual(disabled_bid_response.status_code, 403)
+        self.assertIn("disabled", str(disabled_bid_response.data).lower())
+
+        self.auction_settings.enable_owner_bidding = True
+        self.auction_settings.save(update_fields=["enable_owner_bidding"])
 
         bid_response = self.client.post(
             f"/api/auctions/{self.auction.auction_id}/team-owner-bid/",
