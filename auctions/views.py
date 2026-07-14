@@ -1467,6 +1467,33 @@ class CategoryViewSet(ScopedModelViewSet):
     queryset = Category.objects.select_related("auction")
     serializer_class = CategorySerializer
 
+    def perform_create(self, serializer):
+        super().perform_create(serializer)
+        category = serializer.instance
+        if category.maximum_players > 0:
+            TeamCategoryLimit.objects.bulk_create(
+                [
+                    TeamCategoryLimit(
+                        team=team,
+                        category=category,
+                        maximum_players=category.maximum_players,
+                    )
+                    for team in category.auction.teams.all()
+                ],
+                ignore_conflicts=True,
+            )
+
+    def perform_update(self, serializer):
+        super().perform_update(serializer)
+        category = serializer.instance
+        if "maximum_players" in serializer.validated_data:
+            for team in category.auction.teams.all():
+                TeamCategoryLimit.objects.update_or_create(
+                    team=team,
+                    category=category,
+                    defaults={"maximum_players": category.maximum_players},
+                )
+
 
 class PlayerViewSet(ScopedModelViewSet):
     queryset = Player.objects.select_related("auction", "category", "sold_team")
