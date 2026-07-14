@@ -91,8 +91,20 @@ PLAYER_IMPORT_HEADER_ALIASES = {
     "playername": "full_name",
     "player_name": "full_name",
     "category": "category",
+    "categoryid": "category",
+    "category_id": "category",
+    "categorycode": "category",
+    "category_code": "category",
+    "categorynumber": "category",
+    "category_number": "category",
+    "categoryno": "category",
+    "category_no": "category",
     "categoryname": "category",
     "category_name": "category",
+    "catid": "category",
+    "cat_id": "category",
+    "catcode": "category",
+    "cat_code": "category",
     "image": "image_url",
     "image_link": "image_url",
     "imagelink": "image_url",
@@ -223,7 +235,12 @@ def resolve_import_category(auction: Auction, value, base_value: Decimal | None 
     text = clean_import_cell(value)
     category_name = normalize_category_display_name(text)
     if not category_name:
-        return None, False
+        category, created = Category.objects.get_or_create(
+            auction=auction,
+            name="Uncategorized",
+            defaults={"base_value": Decimal("0"), "color": "#64748B"},
+        )
+        return category, created
 
     category = auction.categories.filter(category_id__iexact=text).first()
     if not category and text.isdigit():
@@ -1449,7 +1466,6 @@ class AuctionViewSet(viewsets.ModelViewSet):
 class CategoryViewSet(ScopedModelViewSet):
     queryset = Category.objects.select_related("auction")
     serializer_class = CategorySerializer
-    http_method_names = ["get", "head", "options"]
 
 
 class PlayerViewSet(ScopedModelViewSet):
