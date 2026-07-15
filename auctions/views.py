@@ -341,6 +341,10 @@ def remaining_required_points(team: Team) -> Decimal:
     return total
 
 
+def available_bid_budget(team: Team) -> Decimal:
+    return team.remaining_purse - remaining_required_points(team)
+
+
 def team_category_limit_message(team: Team, player: Player) -> str:
     if not player.category_id:
         return ""
@@ -400,8 +404,11 @@ def sell_current_player_to_team(
     if player.status == Player.Status.SOLD:
         return
     validate_team_player_limits(team, player)
-    if sold_price > team.remaining_purse:
-        raise ValidationError({"sold_price": "Winning team does not have enough remaining purse."})
+    budget = available_bid_budget(team)
+    if sold_price > budget:
+        raise ValidationError(
+            {"sold_price": f"Winning team must keep reserved purse. Available bid budget is {budget}."}
+        )
 
     player.status = Player.Status.SOLD
     player.sold_team = team
@@ -1246,8 +1253,11 @@ class AuctionViewSet(viewsets.ModelViewSet):
             raise ValidationError({"bid_amount": "Bid amount must be a valid number."}) from exc
         if amount <= 0:
             raise ValidationError({"bid_amount": "Bid amount must be greater than zero."})
-        if amount > team.remaining_purse:
-            raise ValidationError({"bid_amount": "Team does not have enough remaining points."})
+        budget = available_bid_budget(team)
+        if amount > budget:
+            raise ValidationError(
+                {"bid_amount": f"Bid cannot exceed available budget after reserve ({budget})."}
+            )
         current = highest_active_bid(auction, player)
         minimum = (current.bid_amount if current else player.base_price) + auction.bid_increment
         if amount < minimum:
@@ -1288,8 +1298,11 @@ class AuctionViewSet(viewsets.ModelViewSet):
         if not current_highest or current_highest.pk != bid.pk:
             raise ValidationError({"bid": "Only the current highest bid can be approved."})
         validate_team_player_limits(bid.team, bid.player)
-        if bid.bid_amount > bid.team.remaining_purse:
-            raise ValidationError({"bid_amount": "Winning team does not have enough remaining purse."})
+        budget = available_bid_budget(bid.team)
+        if bid.bid_amount > budget:
+            raise ValidationError(
+                {"bid_amount": f"Winning team must keep reserved purse. Available bid budget is {budget}."}
+            )
         bid.approve(request.user)
         AuctionLog.objects.create(auction=auction, actor=request.user, action="bid.approved", message=f"Approved {bid.team.short_name} bid.")
         if bid.player.status not in {Player.Status.SOLD, Player.Status.UNSOLD}:
