@@ -91,8 +91,20 @@ PLAYER_IMPORT_HEADER_ALIASES = {
     "playername": "full_name",
     "player_name": "full_name",
     "category": "category",
+    "categoryid": "category",
+    "category_id": "category",
+    "categorycode": "category",
+    "category_code": "category",
+    "categorynumber": "category",
+    "category_number": "category",
+    "categoryno": "category",
+    "category_no": "category",
     "categoryname": "category",
     "category_name": "category",
+    "catid": "category",
+    "cat_id": "category",
+    "catcode": "category",
+    "cat_code": "category",
     "image": "image_url",
     "image_link": "image_url",
     "imagelink": "image_url",
@@ -223,7 +235,12 @@ def resolve_import_category(auction: Auction, value, base_value: Decimal | None 
     text = clean_import_cell(value)
     category_name = normalize_category_display_name(text)
     if not category_name:
-        return None, False
+        category, created = Category.objects.get_or_create(
+            auction=auction,
+            name="Uncategorized",
+            defaults={"base_value": Decimal("0"), "color": "#64748B"},
+        )
+        return category, created
 
     category = auction.categories.filter(category_id__iexact=text).first()
     if not category and text.isdigit():
@@ -337,6 +354,10 @@ def remaining_required_points(team: Team) -> Decimal:
     return total
 
 
+def available_bid_budget(team: Team) -> Decimal:
+    return team.remaining_purse - remaining_required_points(team)
+
+
 def team_category_limit_message(team: Team, player: Player) -> str:
     if not player.category_id:
         return ""
@@ -396,8 +417,11 @@ def sell_current_player_to_team(
     if player.status == Player.Status.SOLD:
         return
     validate_team_player_limits(team, player)
-    if sold_price > team.remaining_purse:
-        raise ValidationError({"sold_price": "Winning team does not have enough remaining purse."})
+    budget = available_bid_budget(team)
+    if sold_price > budget:
+        raise ValidationError(
+            {"sold_price": f"Winning team must keep reserved purse. Available bid budget is {budget}."}
+        )
 
     player.status = Player.Status.SOLD
     player.sold_team = team
@@ -1242,8 +1266,11 @@ class AuctionViewSet(viewsets.ModelViewSet):
             raise ValidationError({"bid_amount": "Bid amount must be a valid number."}) from exc
         if amount <= 0:
             raise ValidationError({"bid_amount": "Bid amount must be greater than zero."})
-        if amount > team.remaining_purse:
-            raise ValidationError({"bid_amount": "Team does not have enough remaining points."})
+        budget = available_bid_budget(team)
+        if amount > budget:
+            raise ValidationError(
+                {"bid_amount": f"Bid cannot exceed available budget after reserve ({budget})."}
+            )
         current = highest_active_bid(auction, player)
         minimum = (current.bid_amount if current else player.base_price) + auction.bid_increment
         if amount < minimum:
@@ -1284,8 +1311,11 @@ class AuctionViewSet(viewsets.ModelViewSet):
         if not current_highest or current_highest.pk != bid.pk:
             raise ValidationError({"bid": "Only the current highest bid can be approved."})
         validate_team_player_limits(bid.team, bid.player)
-        if bid.bid_amount > bid.team.remaining_purse:
-            raise ValidationError({"bid_amount": "Winning team does not have enough remaining purse."})
+        budget = available_bid_budget(bid.team)
+        if bid.bid_amount > budget:
+            raise ValidationError(
+                {"bid_amount": f"Winning team must keep reserved purse. Available bid budget is {budget}."}
+            )
         bid.approve(request.user)
         AuctionLog.objects.create(auction=auction, actor=request.user, action="bid.approved", message=f"Approved {bid.team.short_name} bid.")
         if bid.player.status not in {Player.Status.SOLD, Player.Status.UNSOLD}:
@@ -1512,7 +1542,33 @@ class AuctionViewSet(viewsets.ModelViewSet):
 class CategoryViewSet(ScopedModelViewSet):
     queryset = Category.objects.select_related("auction")
     serializer_class = CategorySerializer
-    http_method_names = ["get", "head", "options"]
+
+    def perform_create(self, serializer):
+        super().perform_create(serializer)
+        category = serializer.instance
+        if category.maximum_players > 0:
+            TeamCategoryLimit.objects.bulk_create(
+                [
+                    TeamCategoryLimit(
+                        team=team,
+                        category=category,
+                        maximum_players=category.maximum_players,
+                    )
+                    for team in category.auction.teams.all()
+                ],
+                ignore_conflicts=True,
+            )
+
+    def perform_update(self, serializer):
+        super().perform_update(serializer)
+        category = serializer.instance
+        if "maximum_players" in serializer.validated_data:
+            for team in category.auction.teams.all():
+                TeamCategoryLimit.objects.update_or_create(
+                    team=team,
+                    category=category,
+                    defaults={"maximum_players": category.maximum_players},
+                )
 
 
 class PlayerViewSet(ScopedModelViewSet):
