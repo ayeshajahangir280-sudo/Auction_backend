@@ -211,6 +211,48 @@ class AuctionWorkflowTests(TestCase):
             ).exists()
         )
 
+    def test_move_current_player_category_updates_live_player(self):
+        target_category = Category.objects.create(
+            auction=self.auction,
+            name="Reserve",
+            base_value=Decimal("50"),
+        )
+        current_player = self.players[0]
+        current_player.status = Player.Status.IN_AUCTION
+        current_player.save(update_fields=["status"])
+        self.auction.current_player = current_player
+        self.auction.status = Auction.Status.LIVE
+        self.auction.save(update_fields=["current_player", "status"])
+        previous_revision = self.auction.live_revision
+
+        response = self.client.post(
+            f"/api/auctions/{self.auction.auction_id}/move-current-player-category/",
+            {"to_category": target_category.pk},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        current_player.refresh_from_db()
+        self.auction.refresh_from_db()
+        self.assertEqual(response.data["from_category"], self.category.pk)
+        self.assertEqual(response.data["to_category"], target_category.pk)
+        self.assertEqual(current_player.category, target_category)
+        self.assertEqual(current_player.base_price, target_category.base_value)
+        self.assertEqual(self.auction.live_revision, previous_revision + 1)
+        self.assertEqual(response.data["state"]["current_player"]["id"], current_player.pk)
+        self.assertEqual(response.data["state"]["current_player"]["category"], target_category.pk)
+        self.assertEqual(response.data["state"]["current_player"]["category_name"], "Reserve")
+        self.assertEqual(response.data["state"]["current_player"]["base_price"], "50.00")
+        self.assertTrue(
+            AuctionLog.objects.filter(
+                auction=self.auction,
+                action="player.category_moved",
+                metadata__player=current_player.pk,
+                metadata__from_category=self.category.pk,
+                metadata__to_category=target_category.pk,
+            ).exists()
+        )
+
     def test_mark_unsold_saves_player_and_waits_for_admin_next_action(self):
         current_player = self.players[0]
         current_player.status = Player.Status.IN_AUCTION

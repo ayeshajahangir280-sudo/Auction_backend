@@ -1401,6 +1401,51 @@ class AuctionViewSet(viewsets.ModelViewSet):
         return live_response(serialize_live_state(auction))
 
     @transaction.atomic
+    @action(detail=True, methods=["post"], url_path="move-current-player-category")
+    def move_current_player_category(self, request, auction_id=None):
+        require_auction_staff(request.user)
+        auction = self.get_object()
+        player = auction.current_player
+        if not player:
+            raise ValidationError({"player": "No current player selected."})
+
+        source_category = player.category
+        target_category = resolve_auction_category(
+            auction,
+            request.data.get("to_category") or request.data.get("target_category"),
+            "to_category",
+        )
+        if player.category_id == target_category.pk:
+            raise ValidationError({"to_category": "Choose a different category to move this player into."})
+
+        player.category = target_category
+        player.base_price = target_category.base_value
+        player.save(update_fields=["category", "base_price"])
+        auction.current_player = player
+        AuctionLog.objects.create(
+            auction=auction,
+            actor=request.user,
+            action="player.category_moved",
+            message=(
+                f"Moved {player.full_name} from "
+                f"{source_category.name if source_category else 'No category'} to {target_category.name}."
+            ),
+            metadata={
+                "player": player.pk,
+                "from_category": source_category.pk if source_category else None,
+                "to_category": target_category.pk,
+            },
+        )
+        bump_live_revision(auction)
+        return live_response(
+            {
+                "from_category": source_category.pk if source_category else None,
+                "to_category": target_category.pk,
+                "state": serialize_live_state(auction),
+            }
+        )
+
+    @transaction.atomic
     @action(detail=True, methods=["post"], url_path="move-remaining-players")
     def move_remaining_players(self, request, auction_id=None):
         require_auction_staff(request.user)
