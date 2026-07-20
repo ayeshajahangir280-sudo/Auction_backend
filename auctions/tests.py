@@ -7,7 +7,7 @@ from rest_framework.test import APIClient
 
 from config.settings import LOCAL_DEV_CORS_ALLOWED_ORIGIN_REGEXES
 
-from .models import Auction, AuctionSettings, Bid, Category, Player, RoleProfile, SoldPlayer, Sponsor, Team, TeamCategoryLimit, TeamOwner
+from .models import Auction, AuctionLog, AuctionSettings, Bid, Category, Player, RoleProfile, SoldPlayer, Sponsor, Team, TeamCategoryLimit, TeamOwner
 
 
 User = get_user_model()
@@ -166,6 +166,50 @@ class AuctionWorkflowTests(TestCase):
         )
         self.assertEqual(squad_response.status_code, 400)
         self.assertIn("maximum squad of 1", str(squad_response.data))
+
+    def test_move_remaining_players_changes_only_available_players_to_target_category(self):
+        target_category = Category.objects.create(
+            auction=self.auction,
+            name="Reserve",
+            base_value=Decimal("50"),
+        )
+        current_player = self.players[0]
+        current_player.status = Player.Status.IN_AUCTION
+        current_player.save(update_fields=["status"])
+        sold_player = self.players[1]
+        sold_player.status = Player.Status.SOLD
+        sold_player.save(update_fields=["status"])
+        remaining_player = self.players[2]
+        self.auction.current_player = current_player
+        self.auction.status = Auction.Status.LIVE
+        self.auction.save(update_fields=["current_player", "status"])
+        previous_revision = self.auction.live_revision
+
+        response = self.client.post(
+            f"/api/auctions/{self.auction.auction_id}/move-remaining-players/",
+            {"from_category": self.category.pk, "to_category": target_category.pk},
+            format="json",
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.data["moved_count"], 1)
+        remaining_player.refresh_from_db()
+        current_player.refresh_from_db()
+        sold_player.refresh_from_db()
+        self.auction.refresh_from_db()
+        self.assertEqual(remaining_player.category, target_category)
+        self.assertEqual(remaining_player.base_price, target_category.base_value)
+        self.assertEqual(current_player.category, self.category)
+        self.assertEqual(sold_player.category, self.category)
+        self.assertEqual(self.auction.live_revision, previous_revision + 1)
+        self.assertEqual(response.data["state"]["current_player"]["id"], current_player.pk)
+        self.assertTrue(
+            AuctionLog.objects.filter(
+                auction=self.auction,
+                action="players.category_moved",
+                metadata__moved_count=1,
+            ).exists()
+        )
 
     def test_mark_unsold_saves_player_and_waits_for_admin_next_action(self):
         current_player = self.players[0]

@@ -250,6 +250,19 @@ def resolve_import_category(auction: Auction, value, base_value: Decimal | None 
     return category, True
 
 
+def resolve_auction_category(auction: Auction, value, field_name: str) -> Category:
+    text = clean_import_cell(value)
+    if not text:
+        raise ValidationError({field_name: "Choose a category."})
+
+    category = auction.categories.filter(category_id__iexact=text).first()
+    if not category and text.isdigit():
+        category = auction.categories.filter(pk=int(text)).first()
+    if not category:
+        raise ValidationError({field_name: "Category not found for this auction."})
+    return category
+
+
 def user_can_access_auction(user, auction: Auction) -> bool:
     if is_super_admin(user):
         return True
@@ -1356,6 +1369,56 @@ class AuctionViewSet(viewsets.ModelViewSet):
         advance_to_random_player(auction, request.user)
         bump_live_revision(auction)
         return live_response(serialize_live_state(auction))
+
+    @transaction.atomic
+    @action(detail=True, methods=["post"], url_path="move-remaining-players")
+    def move_remaining_players(self, request, auction_id=None):
+        require_auction_staff(request.user)
+        auction = self.get_object()
+        source_category = resolve_auction_category(
+            auction,
+            request.data.get("from_category") or request.data.get("source_category"),
+            "from_category",
+        )
+        target_category = resolve_auction_category(
+            auction,
+            request.data.get("to_category") or request.data.get("target_category"),
+            "to_category",
+        )
+        if source_category.pk == target_category.pk:
+            raise ValidationError({"to_category": "Choose a different category to move players into."})
+
+        players_qs = auction.players.filter(
+            category=source_category,
+            status=Player.Status.AVAILABLE,
+        )
+        moved_count = players_qs.update(
+            category=target_category,
+            base_price=target_category.base_value,
+        )
+        if moved_count:
+            AuctionLog.objects.create(
+                auction=auction,
+                actor=request.user,
+                action="players.category_moved",
+                message=(
+                    f"Moved {moved_count} remaining players from "
+                    f"{source_category.name} to {target_category.name}."
+                ),
+                metadata={
+                    "from_category": source_category.pk,
+                    "to_category": target_category.pk,
+                    "moved_count": moved_count,
+                },
+            )
+            bump_live_revision(auction)
+
+        return live_response(
+            {
+                "moved_count": moved_count,
+                "state": serialize_live_state(auction),
+            }
+        )
 
     @action(detail=True, methods=["get"], url_path="team-roster")
     def team_roster(self, request, auction_id=None):
