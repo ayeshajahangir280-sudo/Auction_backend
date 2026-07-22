@@ -443,14 +443,39 @@ class AuctionWorkflowTests(TestCase):
         self.assertEqual(other_response.status_code, 201)
         self.assertEqual(Decimal(other_response.data["bid_amount"]), current_player.base_price)
 
-        next_response = self.client.post(
+        team_next_response = self.client.post(
             f"/api/auctions/{self.auction.auction_id}/manual-bid/",
-            {"team_id": self.team.team_id, "bid_amount": "105"},
+            {"team_id": self.team.team_id, "bid_amount": "100.50"},
             format="json",
         )
 
-        self.assertEqual(next_response.status_code, 400)
-        self.assertIn("Bid must be at least 110", str(next_response.data))
+        self.assertEqual(team_next_response.status_code, 400)
+        self.assertIn("Bid must be at least 101", str(team_next_response.data))
+
+        team_101_response = self.client.post(
+            f"/api/auctions/{self.auction.auction_id}/manual-bid/",
+            {"team_id": self.team.team_id, "bid_amount": "101"},
+            format="json",
+        )
+        other_101_response = self.client.post(
+            f"/api/auctions/{self.auction.auction_id}/manual-bid/",
+            {"team_id": other_team.team_id, "bid_amount": "101"},
+            format="json",
+        )
+
+        self.assertEqual(team_101_response.status_code, 201)
+        self.assertEqual(other_101_response.status_code, 201)
+        self.assertEqual(Decimal(team_101_response.data["bid_amount"]), Decimal("101"))
+        self.assertEqual(Decimal(other_101_response.data["bid_amount"]), Decimal("101"))
+
+        other_third_response = self.client.post(
+            f"/api/auctions/{self.auction.auction_id}/manual-bid/",
+            {"team_id": other_team.team_id, "bid_amount": "102"},
+            format="json",
+        )
+
+        self.assertEqual(other_third_response.status_code, 201)
+        self.assertEqual(Decimal(other_third_response.data["bid_amount"]), Decimal("102"))
 
     def test_lower_pending_bid_cannot_be_approved_when_higher_bid_exists(self):
         current_player = self.players[0]
