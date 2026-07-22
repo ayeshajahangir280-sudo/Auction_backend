@@ -409,13 +409,21 @@ class AuctionWorkflowTests(TestCase):
         self.assertEqual(response.status_code, 201)
         self.assertEqual(Decimal(response.data["bid_amount"]), Decimal("1000.00"))
 
-    def test_first_bid_can_match_base_price(self):
+    def test_each_team_first_bid_can_match_base_price(self):
         current_player = self.players[0]
         current_player.status = Player.Status.IN_AUCTION
         current_player.save(update_fields=["status"])
         self.auction.current_player = current_player
         self.auction.status = Auction.Status.LIVE
         self.auction.save(update_fields=["current_player", "status"])
+        other_team = Team.objects.create(
+            auction=self.auction,
+            name="Other Team",
+            short_name="OT",
+            purse_amount=Decimal("1000"),
+            remaining_purse=Decimal("1000"),
+            maximum_players=2,
+        )
 
         response = self.client.post(
             f"/api/auctions/{self.auction.auction_id}/manual-bid/",
@@ -425,6 +433,15 @@ class AuctionWorkflowTests(TestCase):
 
         self.assertEqual(response.status_code, 201)
         self.assertEqual(Decimal(response.data["bid_amount"]), current_player.base_price)
+
+        other_response = self.client.post(
+            f"/api/auctions/{self.auction.auction_id}/manual-bid/",
+            {"team_id": other_team.team_id, "bid_amount": "100"},
+            format="json",
+        )
+
+        self.assertEqual(other_response.status_code, 201)
+        self.assertEqual(Decimal(other_response.data["bid_amount"]), current_player.base_price)
 
         next_response = self.client.post(
             f"/api/auctions/{self.auction.auction_id}/manual-bid/",

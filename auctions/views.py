@@ -338,6 +338,19 @@ def highest_active_bid(auction: Auction, player: Player | None = None):
     return qs.order_by("-bid_amount", "-created_at").first()
 
 
+def highest_active_bid_for_team(auction: Auction, player: Player, team: Team):
+    return (
+        auction.bids.select_related("player", "player__category", "team")
+        .filter(
+            player=player,
+            team=team,
+            bid_status__in=[Bid.Status.PENDING, Bid.Status.APPROVED],
+        )
+        .order_by("-bid_amount", "-created_at")
+        .first()
+    )
+
+
 def remaining_required_points(team: Team) -> Decimal:
     total = Decimal("0")
     cache = getattr(team, "_prefetched_objects_cache", {})
@@ -1272,7 +1285,11 @@ class AuctionViewSet(viewsets.ModelViewSet):
                 {"bid_amount": f"Bid cannot exceed available budget after reserve ({budget})."}
             )
         current = highest_active_bid(auction, player)
-        minimum = current.bid_amount + auction.bid_increment if current else player.base_price
+        team_current = highest_active_bid_for_team(auction, player, team)
+        if team_current:
+            minimum = (current.bid_amount if current else player.base_price) + auction.bid_increment
+        else:
+            minimum = player.base_price
         if amount < minimum:
             raise ValidationError({"bid_amount": f"Bid must be at least {minimum}."})
         bid = Bid.objects.create(
