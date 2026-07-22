@@ -57,14 +57,46 @@ class AuctionWorkflowTests(TestCase):
         self.client = APIClient()
         self.client.force_authenticate(self.admin)
 
-    def test_category_management_api_is_read_only(self):
+    def test_category_management_api_creates_category_for_player_import_id(self):
         response = self.client.post(
             "/api/categories/",
-            {"auction": self.auction.pk, "name": "Manual Category"},
+            {
+                "auction": self.auction.pk,
+                "name": "Manual Category",
+                "base_value": "250",
+                "maximum_players": 1,
+            },
             format="json",
         )
 
-        self.assertEqual(response.status_code, 405)
+        self.assertEqual(response.status_code, 201)
+        category = Category.objects.get(pk=response.data["id"])
+        self.assertTrue(category.category_id.startswith("CAT-"))
+        self.assertEqual(category.name, "Manual Category")
+        self.assertEqual(category.base_value, Decimal("250"))
+        self.assertTrue(
+            TeamCategoryLimit.objects.filter(
+                team=self.team,
+                category=category,
+                maximum_players=1,
+            ).exists()
+        )
+
+        upload = SimpleUploadedFile(
+            "players.csv",
+            f"Name,Category\nDelta Player,{category.category_id}\n".encode("utf-8"),
+            content_type="text/csv",
+        )
+        import_response = self.client.post(
+            "/api/players/import-excel/",
+            {"auction": self.auction.pk, "file": upload},
+            format="multipart",
+        )
+
+        self.assertEqual(import_response.status_code, 201)
+        imported_player = Player.objects.get(first_name="Delta")
+        self.assertEqual(imported_player.category, category)
+        self.assertEqual(imported_player.base_price, category.base_value)
 
     def test_player_import_creates_normalized_categories_from_file(self):
         upload = SimpleUploadedFile(
@@ -377,7 +409,7 @@ class AuctionWorkflowTests(TestCase):
         self.assertEqual(response.status_code, 201)
         self.assertEqual(Decimal(response.data["bid_amount"]), Decimal("1000.00"))
 
-    def test_first_bid_must_be_above_base_price(self):
+    def test_first_bid_can_match_base_price(self):
         current_player = self.players[0]
         current_player.status = Player.Status.IN_AUCTION
         current_player.save(update_fields=["status"])
@@ -391,8 +423,17 @@ class AuctionWorkflowTests(TestCase):
             format="json",
         )
 
-        self.assertEqual(response.status_code, 400)
-        self.assertIn("Bid must be at least 110", str(response.data))
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(Decimal(response.data["bid_amount"]), current_player.base_price)
+
+        next_response = self.client.post(
+            f"/api/auctions/{self.auction.auction_id}/manual-bid/",
+            {"team_id": self.team.team_id, "bid_amount": "105"},
+            format="json",
+        )
+
+        self.assertEqual(next_response.status_code, 400)
+        self.assertIn("Bid must be at least 110", str(next_response.data))
 
     def test_lower_pending_bid_cannot_be_approved_when_higher_bid_exists(self):
         current_player = self.players[0]
@@ -512,6 +553,8 @@ class AuctionWorkflowTests(TestCase):
         self.assertEqual(list_response.data[0]["logo_url"], "https://cdn.example.com/sponsor.png")
 
     def test_public_active_includes_project_sponsors(self):
+        self.auction.status = Auction.Status.LIVE
+        self.auction.save(update_fields=["status"])
         Sponsor.objects.create(
             auction=self.auction,
             name="Title Sponsor",

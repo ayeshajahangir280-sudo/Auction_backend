@@ -1272,7 +1272,7 @@ class AuctionViewSet(viewsets.ModelViewSet):
                 {"bid_amount": f"Bid cannot exceed available budget after reserve ({budget})."}
             )
         current = highest_active_bid(auction, player)
-        minimum = (current.bid_amount if current else player.base_price) + auction.bid_increment
+        minimum = current.bid_amount + auction.bid_increment if current else player.base_price
         if amount < minimum:
             raise ValidationError({"bid_amount": f"Bid must be at least {minimum}."})
         bid = Bid.objects.create(
