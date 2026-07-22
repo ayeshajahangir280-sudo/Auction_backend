@@ -409,7 +409,7 @@ class AuctionWorkflowTests(TestCase):
         self.assertEqual(response.status_code, 201)
         self.assertEqual(Decimal(response.data["bid_amount"]), Decimal("1000.00"))
 
-    def test_each_team_first_bid_can_match_base_price(self):
+    def test_first_player_bid_is_base_then_next_bid_increments_by_one(self):
         current_player = self.players[0]
         current_player.status = Player.Status.IN_AUCTION
         current_player.save(update_fields=["status"])
@@ -440,42 +440,35 @@ class AuctionWorkflowTests(TestCase):
             format="json",
         )
 
-        self.assertEqual(other_response.status_code, 201)
-        self.assertEqual(Decimal(other_response.data["bid_amount"]), current_player.base_price)
+        self.assertEqual(other_response.status_code, 400)
+        self.assertIn("Bid must be at least 101", str(other_response.data))
 
-        team_next_response = self.client.post(
-            f"/api/auctions/{self.auction.auction_id}/manual-bid/",
-            {"team_id": self.team.team_id, "bid_amount": "100.50"},
-            format="json",
-        )
-
-        self.assertEqual(team_next_response.status_code, 400)
-        self.assertIn("Bid must be at least 101", str(team_next_response.data))
-
-        team_101_response = self.client.post(
-            f"/api/auctions/{self.auction.auction_id}/manual-bid/",
-            {"team_id": self.team.team_id, "bid_amount": "101"},
-            format="json",
-        )
         other_101_response = self.client.post(
             f"/api/auctions/{self.auction.auction_id}/manual-bid/",
             {"team_id": other_team.team_id, "bid_amount": "101"},
             format="json",
         )
 
-        self.assertEqual(team_101_response.status_code, 201)
         self.assertEqual(other_101_response.status_code, 201)
-        self.assertEqual(Decimal(team_101_response.data["bid_amount"]), Decimal("101"))
         self.assertEqual(Decimal(other_101_response.data["bid_amount"]), Decimal("101"))
 
-        other_third_response = self.client.post(
+        team_next_response = self.client.post(
             f"/api/auctions/{self.auction.auction_id}/manual-bid/",
-            {"team_id": other_team.team_id, "bid_amount": "102"},
+            {"team_id": self.team.team_id, "bid_amount": "101"},
             format="json",
         )
 
-        self.assertEqual(other_third_response.status_code, 201)
-        self.assertEqual(Decimal(other_third_response.data["bid_amount"]), Decimal("102"))
+        self.assertEqual(team_next_response.status_code, 400)
+        self.assertIn("Bid must be at least 102", str(team_next_response.data))
+
+        team_102_response = self.client.post(
+            f"/api/auctions/{self.auction.auction_id}/manual-bid/",
+            {"team_id": self.team.team_id, "bid_amount": "102"},
+            format="json",
+        )
+
+        self.assertEqual(team_102_response.status_code, 201)
+        self.assertEqual(Decimal(team_102_response.data["bid_amount"]), Decimal("102"))
 
     def test_lower_pending_bid_cannot_be_approved_when_higher_bid_exists(self):
         current_player = self.players[0]
