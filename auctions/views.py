@@ -1162,7 +1162,10 @@ class AuctionViewSet(viewsets.ModelViewSet):
 
     @action(detail=False, methods=["get"], url_path="public-active-events")
     def public_active_events(self, request):
-        return prevent_live_cache(HttpResponse(status=204))
+        # The public display needs server-pushed revisions to match the admin
+        # controls across devices. Gunicorn uses a threaded worker in production,
+        # so one venue stream can remain open without blocking normal requests.
+        return sse_response(public_active_revision_stream())
 
     @action(detail=True, methods=["get"], url_path="current-player")
     def current_player(self, request, auction_id=None):
