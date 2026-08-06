@@ -1140,12 +1140,16 @@ class AuctionViewSet(viewsets.ModelViewSet):
 
     @action(detail=True, methods=["get"], url_path="public-live-events")
     def public_live_events(self, request, auction_id=None):
-        auction = self.get_object()
-        return sse_response(auction_revision_stream(auction.pk))
+        # Gunicorn runs synchronous workers in production. A streaming response
+        # occupies a worker for the lifetime of the screen and can block every
+        # normal API request. HTTP 204 also tells EventSource clients not to
+        # reconnect; both screens use fast polling instead.
+        self.get_object()
+        return prevent_live_cache(HttpResponse(status=204))
 
     @action(detail=False, methods=["get"], url_path="public-active-events")
     def public_active_events(self, request):
-        return sse_response(public_active_revision_stream())
+        return prevent_live_cache(HttpResponse(status=204))
 
     @action(detail=True, methods=["get"], url_path="current-player")
     def current_player(self, request, auction_id=None):
