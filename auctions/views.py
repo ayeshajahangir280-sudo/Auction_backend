@@ -10,6 +10,7 @@ from pathlib import Path
 
 from django.conf import settings
 from django.contrib.auth import authenticate, get_user_model
+from django.core.cache import cache
 from django.core.files.base import ContentFile
 from django.core.files.storage import default_storage
 from django.db import transaction
@@ -716,6 +717,18 @@ def build_results(auction: Auction, teams=None) -> dict:
 
 
 def serialize_live_state(auction: Auction, team_scope: Team | None = None) -> dict:
+    scope_id = team_scope.pk if team_scope else "all"
+    cache_key = f"live-state:{auction.pk}:{auction.live_revision}:{scope_id}"
+    cached_state = cache.get(cache_key)
+    if cached_state is not None:
+        return cached_state
+
+    state = _serialize_live_state(auction, team_scope=team_scope)
+    cache.set(cache_key, state, timeout=60)
+    return state
+
+
+def _serialize_live_state(auction: Auction, team_scope: Team | None = None) -> dict:
     current_player = auction.current_player
     bids_qs = live_bid_queryset(auction)
     current_player_bids = (
