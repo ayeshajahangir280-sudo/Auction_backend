@@ -1281,8 +1281,8 @@ class AuctionViewSet(viewsets.ModelViewSet):
             amount = Decimal(str(raw_amount).replace(",", "").strip())
         except (InvalidOperation, ValueError) as exc:
             raise ValidationError({"bid_amount": "Bid amount must be a valid number."}) from exc
-        if amount <= 0:
-            raise ValidationError({"bid_amount": "Bid amount must be greater than zero."})
+        if amount < 0:
+            raise ValidationError({"bid_amount": "Bid amount cannot be negative."})
         budget = available_bid_budget(team)
         if amount > budget:
             raise ValidationError(

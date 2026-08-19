@@ -470,6 +470,41 @@ class AuctionWorkflowTests(TestCase):
         self.assertEqual(team_102_response.status_code, 201)
         self.assertEqual(Decimal(team_102_response.data["bid_amount"]), Decimal("102"))
 
+    def test_zero_base_price_first_bid_is_zero_then_next_bid_is_one(self):
+        current_player = self.players[0]
+        current_player.base_price = Decimal("0")
+        current_player.status = Player.Status.IN_AUCTION
+        current_player.save(update_fields=["base_price", "status"])
+        self.auction.current_player = current_player
+        self.auction.status = Auction.Status.LIVE
+        self.auction.save(update_fields=["current_player", "status"])
+        other_team = Team.objects.create(
+            auction=self.auction,
+            name="Other Team",
+            short_name="OT",
+            purse_amount=Decimal("1000"),
+            remaining_purse=Decimal("1000"),
+            maximum_players=2,
+        )
+
+        first_response = self.client.post(
+            f"/api/auctions/{self.auction.auction_id}/manual-bid/",
+            {"team_id": self.team.team_id, "bid_amount": "0"},
+            format="json",
+        )
+
+        self.assertEqual(first_response.status_code, 201)
+        self.assertEqual(Decimal(first_response.data["bid_amount"]), Decimal("0"))
+
+        second_response = self.client.post(
+            f"/api/auctions/{self.auction.auction_id}/manual-bid/",
+            {"team_id": other_team.team_id, "bid_amount": "1"},
+            format="json",
+        )
+
+        self.assertEqual(second_response.status_code, 201)
+        self.assertEqual(Decimal(second_response.data["bid_amount"]), Decimal("1"))
+
     def test_lower_pending_bid_cannot_be_approved_when_higher_bid_exists(self):
         current_player = self.players[0]
         current_player.status = Player.Status.IN_AUCTION
