@@ -1668,6 +1668,7 @@ class CategoryViewSet(ScopedModelViewSet):
     def perform_update(self, serializer):
         super().perform_update(serializer)
         category = serializer.instance
+        live_state_changed = False
         if "base_value" in serializer.validated_data:
             Player.objects.filter(
                 auction=category.auction,
@@ -1678,6 +1679,9 @@ class CategoryViewSet(ScopedModelViewSet):
                     Player.Status.UNSOLD,
                 ],
             ).update(base_price=category.base_value)
+            live_state_changed = True
+        if "bid_increment" in serializer.validated_data:
+            live_state_changed = True
         if "maximum_players" in serializer.validated_data:
             for team in category.auction.teams.all():
                 TeamCategoryLimit.objects.update_or_create(
@@ -1685,6 +1689,9 @@ class CategoryViewSet(ScopedModelViewSet):
                     category=category,
                     defaults={"maximum_players": category.maximum_players},
                 )
+            live_state_changed = True
+        if live_state_changed:
+            bump_live_revision(category.auction)
 
 
 class PlayerViewSet(ScopedModelViewSet):
