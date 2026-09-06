@@ -11,6 +11,7 @@ from .models import (
     Bid,
     Category,
     Player,
+    ProjectLogo,
     RoleProfile,
     SoldPlayer,
     Sponsor,
@@ -66,6 +67,13 @@ class SponsorSerializer(serializers.ModelSerializer):
         read_only_fields = ["id"]
 
 
+class ProjectLogoSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ProjectLogo
+        fields = ["id", "auction", "logo_url", "status", "sort_order"]
+        read_only_fields = ["id"]
+
+
 class AuctionSettingsSerializer(serializers.ModelSerializer):
     class Meta:
         model = AuctionSettings
@@ -86,6 +94,7 @@ class AuctionSerializer(serializers.ModelSerializer):
     owner_bidding_enabled = serializers.BooleanField(write_only=True, required=False)
     manager_name = serializers.CharField(source="manager.get_username", read_only=True)
     sponsors = SponsorSerializer(many=True, read_only=True)
+    project_logos = ProjectLogoSerializer(many=True, read_only=True)
     settings = AuctionSettingsSerializer(read_only=True)
     team_count = serializers.SerializerMethodField()
     player_count = serializers.SerializerMethodField()
@@ -125,6 +134,7 @@ class AuctionSerializer(serializers.ModelSerializer):
             "player_count",
             "setup_enabled",
             "sponsors",
+            "project_logos",
             "settings",
             "created_at",
             "updated_at",

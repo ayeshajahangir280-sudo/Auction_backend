@@ -149,6 +149,22 @@ class Sponsor(models.Model):
         return self.name
 
 
+class ProjectLogo(models.Model):
+    auction = models.ForeignKey(Auction, on_delete=models.CASCADE, related_name="project_logos")
+    logo_url = models.URLField()
+    status = models.CharField(max_length=16, default="active")
+    sort_order = models.PositiveIntegerField(default=0)
+
+    class Meta:
+        ordering = ["sort_order", "id"]
+        indexes = [
+            models.Index(fields=["auction", "status", "sort_order"], name="project_logo_auc_status_idx"),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.auction.name} project logo {self.pk}"
+
+
 class Category(models.Model):
     class Status(models.TextChoices):
         ACTIVE = "active", "Active"

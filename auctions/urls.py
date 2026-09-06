@@ -10,6 +10,7 @@ from .views import (
     ImageUploadView,
     LoginView,
     PlayerViewSet,
+    ProjectLogoViewSet,
     SoldPlayerViewSet,
     SponsorViewSet,
     TeamOwnerViewSet,
@@ -24,6 +25,7 @@ router.register("players", PlayerViewSet, basename="player")
 router.register("teams", TeamViewSet, basename="team")
 router.register("team-owners", TeamOwnerViewSet, basename="team-owner")
 router.register("sponsors", SponsorViewSet, basename="sponsor")
+router.register("project-logos", ProjectLogoViewSet, basename="project-logo")
 router.register("bids", BidViewSet, basename="bid")
 router.register("sold-players", SoldPlayerViewSet, basename="sold-player")
 router.register("logs", AuctionLogViewSet, basename="auction-log")

@@ -27,7 +27,7 @@ from rest_framework.utils.encoders import JSONEncoder
 from rest_framework.views import APIView
 from rest_framework_simplejwt.tokens import RefreshToken
 
-from .models import Auction, AuctionLog, AuctionSettings, Bid, Category, Player, RoleProfile, SoldPlayer, Sponsor, Team, TeamCategoryLimit, TeamOwner, UploadedImage
+from .models import Auction, AuctionLog, AuctionSettings, Bid, Category, Player, ProjectLogo, RoleProfile, SoldPlayer, Sponsor, Team, TeamCategoryLimit, TeamOwner, UploadedImage
 from .permissions import is_auction_manager, is_super_admin, is_team_owner, scoped_auction_for_user
 from .pdf import build_team_roster_pdf, team_roster_pdf_filename
 from .serializers import (
@@ -36,6 +36,7 @@ from .serializers import (
     BidSerializer,
     CategorySerializer,
     PlayerSerializer,
+    ProjectLogoSerializer,
     SoldPlayerSerializer,
     SponsorSerializer,
     TeamOwnerSerializer,
@@ -499,7 +500,7 @@ def live_auction_queryset():
         "current_player",
         "current_player__category",
         "settings",
-    ).prefetch_related("sponsors")
+    ).prefetch_related("sponsors", "project_logos")
 
 
 def live_auction_for_pk(auction_pk: int):
@@ -551,6 +552,16 @@ def live_sponsor_data(sponsor: Sponsor) -> dict:
     }
 
 
+def live_project_logo_data(logo: ProjectLogo) -> dict:
+    return {
+        "id": logo.pk,
+        "auction": logo.auction_id,
+        "logo_url": logo.logo_url,
+        "status": logo.status,
+        "sort_order": logo.sort_order,
+    }
+
+
 def live_auction_data(auction: Auction, results: dict, team_count: int) -> dict:
     return {
         "id": auction.pk,
@@ -579,6 +590,7 @@ def live_auction_data(auction: Auction, results: dict, team_count: int) -> dict:
         "player_count": results["sold_count"] + results["unsold_count"] + results["available_count"],
         "setup_enabled": True,
         "sponsors": [live_sponsor_data(sponsor) for sponsor in auction.sponsors.all()],
+        "project_logos": [live_project_logo_data(logo) for logo in auction.project_logos.all()],
         "settings": live_settings_data(auction),
         "created_at": iso_datetime(auction.created_at),
         "updated_at": iso_datetime(auction.updated_at),
@@ -1095,7 +1107,7 @@ class AuctionViewSet(viewsets.ModelViewSet):
         "current_player",
         "current_player__category",
         "settings",
-    ).prefetch_related("sponsors")
+    ).prefetch_related("sponsors", "project_logos")
     serializer_class = AuctionSerializer
     lookup_field = "auction_id"
 
@@ -1967,6 +1979,11 @@ class TeamOwnerViewSet(ScopedModelViewSet):
 class SponsorViewSet(ScopedModelViewSet):
     queryset = Sponsor.objects.select_related("auction")
     serializer_class = SponsorSerializer
+
+
+class ProjectLogoViewSet(ScopedModelViewSet):
+    queryset = ProjectLogo.objects.select_related("auction")
+    serializer_class = ProjectLogoSerializer
 
 
 class BidViewSet(mixins.ListModelMixin, mixins.RetrieveModelMixin, viewsets.GenericViewSet):
