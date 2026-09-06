@@ -147,6 +147,13 @@ PLAYER_IMPORT_HEADER_ALIASES = {
     "basevalue": "base_price",
     "base_value": "base_price",
     "price": "base_price",
+    "bid": "bid_increment",
+    "bidincrement": "bid_increment",
+    "bid_increment": "bid_increment",
+    "bidstep": "bid_increment",
+    "bid_step": "bid_increment",
+    "bidspercategory": "bid_increment",
+    "bids_per_category": "bid_increment",
     "order": "queue_order",
     "queueorder": "queue_order",
     "queue_order": "queue_order",
@@ -195,14 +202,14 @@ def canonical_import_key(value) -> str | None:
     return PLAYER_IMPORT_HEADER_ALIASES.get(key) or PLAYER_IMPORT_HEADER_ALIASES.get(key.replace("_", ""))
 
 
-def parse_import_decimal(value, default: str = "0") -> Decimal:
+def parse_import_decimal(value, default: str = "0", field_label: str = "Base price") -> Decimal:
     text = clean_import_cell(value).replace(",", "")
     if not text:
         text = default
     try:
         return Decimal(text)
     except InvalidOperation as exc:
-        raise ValueError("Base price must be a number.") from exc
+        raise ValueError(f"{field_label} must be a number.") from exc
 
 
 def parse_import_int(value, default: int = 0) -> int:
@@ -233,14 +240,31 @@ def normalize_category_lookup_key(value) -> str:
     return normalize_category_display_name(value).casefold()
 
 
-def resolve_import_category(auction: Auction, value, base_value: Decimal | None = None):
+def category_bid_step(player: Player) -> Decimal:
+    if player.category_id and player.category and player.category.bid_increment > 0:
+        return player.category.bid_increment
+    if player.auction.bid_increment > 0:
+        return player.auction.bid_increment
+    return BID_STEP
+
+
+def resolve_import_category(
+    auction: Auction,
+    value,
+    base_value: Decimal | None = None,
+    bid_increment: Decimal | None = None,
+):
     text = clean_import_cell(value)
     category_name = normalize_category_display_name(text)
     if not category_name:
         category, created = Category.objects.get_or_create(
             auction=auction,
             name="Uncategorized",
-            defaults={"base_value": Decimal("0"), "color": "#64748B"},
+            defaults={
+                "base_value": Decimal("0"),
+                "bid_increment": bid_increment or auction.bid_increment or BID_STEP,
+                "color": "#64748B",
+            },
         )
         return category, created
 
@@ -259,12 +283,16 @@ def resolve_import_category(auction: Auction, value, base_value: Decimal | None 
         if base_value and base_value > 0 and category.base_value == 0:
             category.base_value = base_value
             category.save(update_fields=["base_value"])
+        if bid_increment and bid_increment > 0 and category.bid_increment != bid_increment:
+            category.bid_increment = bid_increment
+            category.save(update_fields=["bid_increment"])
         return category, False
 
     category = Category.objects.create(
         auction=auction,
         name=category_name[:120],
         base_value=base_value or Decimal("0"),
+        bid_increment=bid_increment or auction.bid_increment or BID_STEP,
     )
     return category, True
 
@@ -540,7 +568,7 @@ def live_auction_data(auction: Auction, results: dict, team_count: int) -> dict:
         "purse_amount": decimal_text(auction.purse_amount),
         "purse": decimal_text(auction.purse_amount),
         "purse_type": auction.unit,
-        "bid_increment": decimal_text(BID_STEP),
+        "bid_increment": decimal_text(auction.bid_increment),
         "timer_duration": auction.timer_duration,
         "minimum_players_per_team": auction.minimum_players_per_team,
         "maximum_players_per_team": auction.maximum_players_per_team,
@@ -574,6 +602,7 @@ def live_player_data(player: Player | None) -> dict | None:
         "country": player.country,
         "age": player.age,
         "base_price": decimal_text(player.base_price),
+        "bid_increment": decimal_text(category_bid_step(player)),
         "extra_field_1": player.extra_field_1,
         "extra_field_2": player.extra_field_2,
         "extra_field_3": player.extra_field_3,
@@ -1290,7 +1319,7 @@ class AuctionViewSet(viewsets.ModelViewSet):
             )
         current = highest_active_bid(auction, player)
         if current:
-            minimum = current.bid_amount + BID_STEP
+            minimum = current.bid_amount + category_bid_step(player)
         else:
             minimum = player.base_price
         if amount < minimum:
@@ -1627,6 +1656,16 @@ class CategoryViewSet(ScopedModelViewSet):
     def perform_update(self, serializer):
         super().perform_update(serializer)
         category = serializer.instance
+        if "base_value" in serializer.validated_data:
+            Player.objects.filter(
+                auction=category.auction,
+                category=category,
+                status__in=[
+                    Player.Status.AVAILABLE,
+                    Player.Status.IN_AUCTION,
+                    Player.Status.UNSOLD,
+                ],
+            ).update(base_price=category.base_value)
         if "maximum_players" in serializer.validated_data:
             for team in category.auction.teams.all():
                 TeamCategoryLimit.objects.update_or_create(
@@ -1776,7 +1815,19 @@ class PlayerViewSet(ScopedModelViewSet):
                     base_price_value = row_value(row, "base_price")
                     base_price_text = clean_import_cell(base_price_value)
                     imported_base_price = parse_import_decimal(base_price_value, "0") if base_price_text else Decimal("0")
-                    category, category_created = resolve_import_category(auction, row_value(row, "category"), imported_base_price)
+                    bid_increment_value = row_value(row, "bid_increment")
+                    bid_increment_text = clean_import_cell(bid_increment_value)
+                    imported_bid_increment = (
+                        parse_import_decimal(bid_increment_value, "1", "Bid")
+                        if bid_increment_text
+                        else None
+                    )
+                    category, category_created = resolve_import_category(
+                        auction,
+                        row_value(row, "category"),
+                        imported_base_price,
+                        imported_bid_increment,
+                    )
                     if category_created and category:
                         created_category_ids.add(category.pk)
                     player_base_price = imported_base_price if base_price_text else (category.base_value if category else Decimal("0"))

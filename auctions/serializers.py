@@ -235,6 +235,7 @@ class CategorySerializer(serializers.ModelSerializer):
             "minimum_players",
             "maximum_players",
             "base_value",
+            "bid_increment",
             "color",
             "status",
         ]
@@ -405,6 +406,7 @@ class TeamOwnerSerializer(serializers.ModelSerializer):
 
 class PlayerSerializer(serializers.ModelSerializer):
     category_name = serializers.CharField(source="category.name", read_only=True)
+    bid_increment = serializers.SerializerMethodField()
     sold_team_name = serializers.CharField(source="sold_team.name", read_only=True)
     role = serializers.ChoiceField(choices=Player.Role.choices, required=False, allow_blank=True)
 
@@ -424,6 +426,7 @@ class PlayerSerializer(serializers.ModelSerializer):
             "country",
             "age",
             "base_price",
+            "bid_increment",
             "extra_field_1",
             "extra_field_2",
             "extra_field_3",
@@ -435,6 +438,13 @@ class PlayerSerializer(serializers.ModelSerializer):
             "queue_order",
         ]
         read_only_fields = ["id", "player_id", "full_name", "sold_team", "sold_price"]
+
+    def get_bid_increment(self, obj):
+        if obj.category_id and obj.category and obj.category.bid_increment > 0:
+            return str(obj.category.bid_increment)
+        if obj.auction and obj.auction.bid_increment > 0:
+            return str(obj.auction.bid_increment)
+        return "1"
 
 
 class BidSerializer(serializers.ModelSerializer):

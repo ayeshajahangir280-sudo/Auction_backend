@@ -160,6 +160,7 @@ class Category(models.Model):
     minimum_players = models.PositiveIntegerField(default=0)
     maximum_players = models.PositiveIntegerField(default=0)
     base_value = models.DecimalField(max_digits=14, decimal_places=2, default=0)
+    bid_increment = models.DecimalField(max_digits=14, decimal_places=2, default=1)
     color = models.CharField(max_length=32, default="#7C3AED")
     status = models.CharField(max_length=16, choices=Status.choices, default=Status.ACTIVE)
 
