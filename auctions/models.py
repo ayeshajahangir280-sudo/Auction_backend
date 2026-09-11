@@ -413,3 +413,34 @@ class AuctionLog(models.Model):
 
     def __str__(self) -> str:
         return f"{self.action} - {self.auction.name}"
+
+
+class AuctionEvent(models.Model):
+    auction = models.ForeignKey(Auction, on_delete=models.CASCADE, related_name="events")
+    revision = models.PositiveBigIntegerField()
+    event_id = models.UUIDField(default=uuid.uuid4, unique=True, editable=False)
+    idempotency_key = models.CharField(max_length=120, blank=True)
+    event_type = models.CharField(max_length=80)
+    payload = models.JSONField(default=dict, blank=True)
+    actor = models.ForeignKey(settings.AUTH_USER_MODEL, on_delete=models.SET_NULL, null=True, blank=True)
+    device_id = models.CharField(max_length=120, blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    acknowledged_at = models.DateTimeField(null=True, blank=True)
+
+    class Meta:
+        ordering = ["revision"]
+        indexes = [
+            models.Index(fields=["auction", "revision"], name="event_auc_revision_idx"),
+            models.Index(fields=["auction", "created_at"], name="event_auc_created_idx"),
+        ]
+        constraints = [
+            models.UniqueConstraint(fields=["auction", "revision"], name="unique_event_revision_per_auction"),
+            models.UniqueConstraint(
+                fields=["auction", "idempotency_key"],
+                condition=~models.Q(idempotency_key=""),
+                name="unique_event_idempotency_per_auction",
+            ),
+        ]
+
+    def __str__(self) -> str:
+        return f"{self.auction.auction_id} r{self.revision} {self.event_type}"

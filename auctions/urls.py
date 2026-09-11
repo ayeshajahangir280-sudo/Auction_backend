@@ -11,6 +11,7 @@ from .views import (
     LoginView,
     PlayerViewSet,
     ProjectLogoViewSet,
+    RefreshAccessTokenView,
     SoldPlayerViewSet,
     SponsorViewSet,
     TeamOwnerViewSet,
@@ -33,6 +34,7 @@ router.register("users", UserViewSet, basename="user")
 
 urlpatterns = [
     path("auth/login/", LoginView.as_view(), name="login"),
+    path("auth/refresh/", RefreshAccessTokenView.as_view(), name="refresh-token"),
     path("auth/me/", CurrentUserView.as_view(), name="current-user"),
     path("uploads/image/", ImageUploadView.as_view(), name="image-upload"),
     path("", include(router.urls)),

@@ -27,7 +27,7 @@ from rest_framework.utils.encoders import JSONEncoder
 from rest_framework.views import APIView
 from rest_framework_simplejwt.tokens import RefreshToken
 
-from .models import Auction, AuctionLog, AuctionSettings, Bid, Category, Player, ProjectLogo, RoleProfile, SoldPlayer, Sponsor, Team, TeamCategoryLimit, TeamOwner, UploadedImage
+from .models import Auction, AuctionEvent, AuctionLog, AuctionSettings, Bid, Category, Player, ProjectLogo, RoleProfile, SoldPlayer, Sponsor, Team, TeamCategoryLimit, TeamOwner, UploadedImage
 from .permissions import is_auction_manager, is_super_admin, is_team_owner, scoped_auction_for_user
 from .pdf import build_team_roster_pdf, team_roster_pdf_filename
 from .serializers import (
@@ -334,9 +334,106 @@ def live_response(data, status_code=status.HTTP_200_OK):
     return prevent_live_cache(Response(data, status=status_code))
 
 
+def json_safe(data):
+    return json.loads(json.dumps(data, separators=(",", ":"), cls=JSONEncoder))
+
+
 def bump_live_revision(auction: Auction) -> None:
     Auction.objects.filter(pk=auction.pk).update(live_revision=F("live_revision") + 1, updated_at=timezone.now())
     auction.refresh_from_db(fields=["live_revision", "updated_at"])
+
+
+def lock_auction(auction: Auction) -> Auction:
+    return Auction.objects.select_for_update().get(pk=auction.pk)
+
+
+def request_idempotency_key(request) -> str:
+    return (
+        request.headers.get("Idempotency-Key")
+        or request.headers.get("X-Idempotency-Key")
+        or str(request.data.get("idempotency_key", "") if hasattr(request, "data") else "")
+    ).strip()[:120]
+
+
+def request_device_id(request) -> str:
+    return (
+        request.headers.get("X-Device-Id")
+        or str(request.data.get("device_id", "") if hasattr(request, "data") else "")
+    ).strip()[:120]
+
+
+def existing_event_response(auction: Auction, idempotency_key: str):
+    if not idempotency_key:
+        return None
+    event = AuctionEvent.objects.filter(auction=auction, idempotency_key=idempotency_key).first()
+    if not event:
+        return None
+    return live_response(event.payload)
+
+
+def commit_live_event(
+    auction: Auction,
+    *,
+    event_type: str,
+    actor=None,
+    idempotency_key: str = "",
+    device_id: str = "",
+    payload: dict | None = None,
+) -> AuctionEvent:
+    bump_live_revision(auction)
+    event_payload = {
+        **(payload or {}),
+        "auctionId": auction.auction_id,
+        "revision": auction.live_revision,
+        "serverTimestamp": iso_datetime(timezone.now()),
+        "eventType": event_type,
+    }
+    event = AuctionEvent.objects.create(
+        auction=auction,
+        revision=auction.live_revision,
+        idempotency_key=idempotency_key,
+        event_type=event_type,
+        payload=json_safe(event_payload),
+        actor=actor,
+        device_id=device_id,
+        acknowledged_at=timezone.now(),
+    )
+    event_payload["eventId"] = str(event.event_id)
+    event.payload = json_safe(event_payload)
+    event.save(update_fields=["payload"])
+    return event
+
+
+def record_current_revision_event(
+    auction: Auction,
+    *,
+    event_type: str,
+    actor=None,
+    idempotency_key: str = "",
+    device_id: str = "",
+    payload: dict | None = None,
+) -> AuctionEvent:
+    event_payload = {
+        **(payload or {}),
+        "auctionId": auction.auction_id,
+        "revision": auction.live_revision,
+        "serverTimestamp": iso_datetime(timezone.now()),
+        "eventType": event_type,
+    }
+    event = AuctionEvent.objects.create(
+        auction=auction,
+        revision=auction.live_revision,
+        idempotency_key=idempotency_key,
+        event_type=event_type,
+        payload=json_safe(event_payload),
+        actor=actor,
+        device_id=device_id,
+        acknowledged_at=timezone.now(),
+    )
+    event_payload["eventId"] = str(event.event_id)
+    event.payload = json_safe(event_payload)
+    event.save(update_fields=["payload"])
+    return event
 
 
 def sse_event(event: str, data: dict, event_id: str | int | None = None) -> str:
@@ -1016,6 +1113,20 @@ class LoginView(APIView):
         )
 
 
+class RefreshAccessTokenView(APIView):
+    permission_classes = [AllowAny]
+
+    def post(self, request):
+        refresh_value = request.data.get("refresh", "")
+        if not refresh_value:
+            return Response({"detail": "Refresh token is required."}, status=status.HTTP_401_UNAUTHORIZED)
+        try:
+            refresh = RefreshToken(refresh_value)
+        except Exception:
+            return Response({"detail": "Your session has expired. Please sign in again."}, status=status.HTTP_401_UNAUTHORIZED)
+        return Response({"access": str(refresh.access_token)})
+
+
 class CurrentUserView(APIView):
     def get(self, request):
         return Response(UserSummarySerializer(request.user).data)
@@ -1210,9 +1321,15 @@ class AuctionViewSet(viewsets.ModelViewSet):
         return Response(PlayerSerializer(auction.current_player).data if auction.current_player else None)
 
     @action(detail=True, methods=["post"], url_path="start-auction")
+    @transaction.atomic
     def start_auction(self, request, auction_id=None):
         require_auction_staff(request.user)
-        auction = self.get_object()
+        base_auction = self.get_object()
+        idempotency_key = request_idempotency_key(request)
+        existing = existing_event_response(base_auction, idempotency_key)
+        if existing:
+            return existing
+        auction = lock_auction(base_auction)
         current_player_is_live = auction.current_player and auction.current_player.status == Player.Status.IN_AUCTION
         if not auction.players.filter(status=Player.Status.AVAILABLE).exists() and not current_player_is_live:
             raise ValidationError({"players": "Add available players before starting the auction."})
@@ -1227,14 +1344,27 @@ class AuctionViewSet(viewsets.ModelViewSet):
             action="auction.started",
             message="Auction was started.",
         )
-        bump_live_revision(auction)
-        return live_response(serialize_live_state(auction))
+        commit_live_event(
+            auction,
+            event_type="auction.started",
+            actor=request.user,
+            idempotency_key=idempotency_key,
+            device_id=request_device_id(request),
+        )
+        state = serialize_live_state(auction)
+        AuctionEvent.objects.filter(auction=auction, revision=auction.live_revision).update(payload=json_safe(state))
+        return live_response(state)
 
     @transaction.atomic
     @action(detail=True, methods=["post"], url_path="complete-auction")
     def complete_auction(self, request, auction_id=None):
         require_auction_staff(request.user)
-        auction = self.get_object()
+        base_auction = self.get_object()
+        idempotency_key = request_idempotency_key(request)
+        existing = existing_event_response(base_auction, idempotency_key)
+        if existing:
+            return existing
+        auction = lock_auction(base_auction)
         auction.players.filter(status__in=[Player.Status.AVAILABLE, Player.Status.IN_AUCTION]).update(
             status=Player.Status.UNSOLD
         )
@@ -1248,13 +1378,27 @@ class AuctionViewSet(viewsets.ModelViewSet):
             action="auction.completed",
             message="Auction was marked completed.",
         )
-        bump_live_revision(auction)
-        return live_response(serialize_live_state(auction))
+        commit_live_event(
+            auction,
+            event_type="auction.completed",
+            actor=request.user,
+            idempotency_key=idempotency_key,
+            device_id=request_device_id(request),
+        )
+        state = serialize_live_state(auction)
+        AuctionEvent.objects.filter(auction=auction, revision=auction.live_revision).update(payload=json_safe(state))
+        return live_response(state)
 
+    @transaction.atomic
     @action(detail=True, methods=["post"], url_path="set-current-player")
     def set_current_player(self, request, auction_id=None):
         require_auction_staff(request.user)
-        auction = self.get_object()
+        base_auction = self.get_object()
+        idempotency_key = request_idempotency_key(request)
+        existing = existing_event_response(base_auction, idempotency_key)
+        if existing:
+            return existing
+        auction = lock_auction(base_auction)
         player_code = request.data.get("player_id") or request.data.get("player")
         player = auction.players.filter(player_id=player_code).first() or auction.players.filter(pk=player_code).first()
         if not player:
@@ -1276,15 +1420,26 @@ class AuctionViewSet(viewsets.ModelViewSet):
         auction.sold_animation_state = False
         auction.save(update_fields=["current_player", "status", "sold_animation_state"])
         AuctionLog.objects.create(auction=auction, actor=request.user, action="auction.current_player", message=f"{player.full_name} is now live.")
-        bump_live_revision(auction)
-        return live_response(serialize_live_state(auction))
+        commit_live_event(
+            auction,
+            event_type="player.selected",
+            actor=request.user,
+            idempotency_key=idempotency_key,
+            device_id=request_device_id(request),
+            payload={"playerId": player.pk},
+        )
+        state = serialize_live_state(auction)
+        AuctionEvent.objects.filter(auction=auction, revision=auction.live_revision).update(payload=json_safe(state))
+        return live_response(state)
 
+    @transaction.atomic
     @action(detail=True, methods=["post"], url_path="manual-bid")
     def manual_bid(self, request, auction_id=None):
         auction = self.get_object()
         require_auction_staff(request.user)
         return self._create_bid(request, auction, Bid.BidType.MANUAL)
 
+    @transaction.atomic
     @action(detail=True, methods=["post"], url_path="team-owner-bid")
     def team_owner_bid(self, request, auction_id=None):
         if not is_team_owner(request.user):
@@ -1296,6 +1451,11 @@ class AuctionViewSet(viewsets.ModelViewSet):
         return self._create_bid(request, auction, Bid.BidType.TEAM_OWNER)
 
     def _create_bid(self, request, auction: Auction, bid_type: str):
+        idempotency_key = request_idempotency_key(request)
+        existing = existing_event_response(auction, idempotency_key)
+        if existing:
+            return existing
+        auction = lock_auction(auction)
         player = auction.current_player
         if not player:
             raise ValidationError({"player": "Set a current player before bidding."})
@@ -1350,8 +1510,19 @@ class AuctionViewSet(viewsets.ModelViewSet):
             action="bid.pending",
             message=f"{team.short_name} bid {amount} for {player.full_name}.",
         )
-        bump_live_revision(auction)
-        return live_response(BidSerializer(bid).data, status.HTTP_201_CREATED)
+        commit_live_event(
+            auction,
+            event_type="bid.created",
+            actor=request.user,
+            idempotency_key=idempotency_key,
+            device_id=request_device_id(request),
+            payload={"playerId": player.pk, "teamId": team.pk, "amount": str(amount), "bidId": bid.pk},
+        )
+        payload = BidSerializer(bid).data
+        payload["revision"] = auction.live_revision
+        payload["event_id"] = str(AuctionEvent.objects.get(auction=auction, revision=auction.live_revision).event_id)
+        AuctionEvent.objects.filter(auction=auction, revision=auction.live_revision).update(payload=json_safe(payload))
+        return live_response(payload, status.HTTP_201_CREATED)
 
     @action(detail=True, methods=["get"], url_path="pending-bids")
     def pending_bids(self, request, auction_id=None):
@@ -1364,7 +1535,12 @@ class AuctionViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=["post"], url_path=r"bids/(?P<bid_pk>[^/.]+)/approve")
     def approve_bid(self, request, auction_id=None, bid_pk=None):
         require_auction_staff(request.user)
-        auction = self.get_object()
+        base_auction = self.get_object()
+        idempotency_key = request_idempotency_key(request)
+        existing = existing_event_response(base_auction, idempotency_key)
+        if existing:
+            return existing
+        auction = lock_auction(base_auction)
         bid = auction.bids.select_related("player", "team").get(pk=bid_pk)
         if bid.bid_status != Bid.Status.PENDING:
             raise ValidationError({"bid": "Only pending bids can be approved."})
@@ -1389,24 +1565,63 @@ class AuctionViewSet(viewsets.ModelViewSet):
                 winning_bid=bid,
             )
         else:
-            bump_live_revision(auction)
-        return live_response(serialize_live_state(auction))
+            commit_live_event(
+                auction,
+                event_type="bid.approved",
+                actor=request.user,
+                idempotency_key=idempotency_key,
+                device_id=request_device_id(request),
+                payload={"bidId": bid.pk, "playerId": bid.player_id, "teamId": bid.team_id},
+            )
+        if not AuctionEvent.objects.filter(auction=auction, revision=auction.live_revision).exists():
+            record_current_revision_event(
+                auction,
+                event_type="player.sold",
+                actor=request.user,
+                idempotency_key=idempotency_key,
+                device_id=request_device_id(request),
+                payload={"bidId": bid.pk, "playerId": bid.player_id, "teamId": bid.team_id},
+            )
+        state = serialize_live_state(auction)
+        AuctionEvent.objects.filter(auction=auction, revision=auction.live_revision).update(payload=json_safe(state))
+        return live_response(state)
 
+    @transaction.atomic
     @action(detail=True, methods=["post"], url_path=r"bids/(?P<bid_pk>[^/.]+)/reject")
     def reject_bid(self, request, auction_id=None, bid_pk=None):
         require_auction_staff(request.user)
-        auction = self.get_object()
+        base_auction = self.get_object()
+        idempotency_key = request_idempotency_key(request)
+        existing = existing_event_response(base_auction, idempotency_key)
+        if existing:
+            return existing
+        auction = lock_auction(base_auction)
         bid = auction.bids.get(pk=bid_pk)
         bid.reject(request.user)
         AuctionLog.objects.create(auction=auction, actor=request.user, action="bid.rejected", message=f"Rejected {bid.team.short_name} bid.")
-        bump_live_revision(auction)
-        return live_response(BidSerializer(bid).data)
+        commit_live_event(
+            auction,
+            event_type="bid.rejected",
+            actor=request.user,
+            idempotency_key=idempotency_key,
+            device_id=request_device_id(request),
+            payload={"bidId": bid.pk},
+        )
+        payload = BidSerializer(bid).data
+        payload["revision"] = auction.live_revision
+        AuctionEvent.objects.filter(auction=auction, revision=auction.live_revision).update(payload=json_safe(payload))
+        return live_response(payload)
 
     @transaction.atomic
     @action(detail=True, methods=["post"], url_path="sell-player")
     def sell_player(self, request, auction_id=None):
         require_auction_staff(request.user)
-        auction = self.get_object()
+        base_auction = self.get_object()
+        idempotency_key = request_idempotency_key(request)
+        existing = existing_event_response(base_auction, idempotency_key)
+        if existing:
+            return existing
+        auction = lock_auction(base_auction)
         player = auction.current_player
         if not player:
             raise ValidationError({"player": "No current player selected."})
@@ -1428,12 +1643,28 @@ class AuctionViewSet(viewsets.ModelViewSet):
             actor=request.user,
             winning_bid=winning_bid,
         )
-        return live_response(serialize_live_state(auction))
+        record_current_revision_event(
+            auction,
+            event_type="player.sold",
+            actor=request.user,
+            idempotency_key=idempotency_key,
+            device_id=request_device_id(request),
+            payload={"playerId": player.pk, "teamId": team.pk, "amount": str(sold_price)},
+        )
+        state = serialize_live_state(auction)
+        AuctionEvent.objects.filter(auction=auction, revision=auction.live_revision).update(payload=json_safe(state))
+        return live_response(state)
 
+    @transaction.atomic
     @action(detail=True, methods=["post"], url_path="mark-unsold")
     def mark_unsold(self, request, auction_id=None):
         require_auction_staff(request.user)
-        auction = self.get_object()
+        base_auction = self.get_object()
+        idempotency_key = request_idempotency_key(request)
+        existing = existing_event_response(base_auction, idempotency_key)
+        if existing:
+            return existing
+        auction = lock_auction(base_auction)
         player = auction.current_player
         if not player:
             raise ValidationError({"player": "No current player selected."})
@@ -1450,16 +1681,40 @@ class AuctionViewSet(viewsets.ModelViewSet):
             approved_at=timezone.now(),
         )
         AuctionLog.objects.create(auction=auction, actor=request.user, action="player.unsold", message=f"{player.full_name} marked unsold.")
-        bump_live_revision(auction)
-        return live_response(serialize_live_state(auction))
+        commit_live_event(
+            auction,
+            event_type="player.unsold",
+            actor=request.user,
+            idempotency_key=idempotency_key,
+            device_id=request_device_id(request),
+            payload={"playerId": player.pk},
+        )
+        state = serialize_live_state(auction)
+        AuctionEvent.objects.filter(auction=auction, revision=auction.live_revision).update(payload=json_safe(state))
+        return live_response(state)
 
+    @transaction.atomic
     @action(detail=True, methods=["post"], url_path="next-player")
     def next_player(self, request, auction_id=None):
         require_auction_staff(request.user)
-        auction = self.get_object()
+        base_auction = self.get_object()
+        idempotency_key = request_idempotency_key(request)
+        existing = existing_event_response(base_auction, idempotency_key)
+        if existing:
+            return existing
+        auction = lock_auction(base_auction)
         advance_to_random_player(auction, request.user)
-        bump_live_revision(auction)
-        return live_response(serialize_live_state(auction))
+        commit_live_event(
+            auction,
+            event_type="player.next",
+            actor=request.user,
+            idempotency_key=idempotency_key,
+            device_id=request_device_id(request),
+            payload={"playerId": auction.current_player_id},
+        )
+        state = serialize_live_state(auction)
+        AuctionEvent.objects.filter(auction=auction, revision=auction.live_revision).update(payload=json_safe(state))
+        return live_response(state)
 
     @transaction.atomic
     @action(detail=True, methods=["post"], url_path="move-current-player-category")
